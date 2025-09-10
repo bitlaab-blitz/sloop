@@ -22,8 +22,6 @@ defer sloop.deinit();
 
 ## Bucket Operations
 
-Replaces the existing record if the key already exists.
-
 ```zig
 var bucket = sloop.bucket();
 
@@ -39,55 +37,56 @@ defer bucket.freeList(items);
 for (items) |item| { std.debug.print("{s}\n", .{item}); }
 ```
 
-Inserts the record only if the key already exists.
+## Object Operations
 
 ```zig
-try redox.set("foo", "bar", .IfExists);
+var obj = sloop.object();
+
+// Puts object in the bucket
+const uuid = try obj.put("test_img2", "simple.txt", "hello, world!", &.{
+    "john", "doe"
+});
+std.debug.print("{s}\n", .{uuid});
+
+// Gets object data from the bucket
+const out = (try obj.get("test_img2", &uuid)).?;
+defer heap.free(out);
+std.debug.print("{s}\n", .{out});
+
+// Gets object info from the bucket
+var info = (try obj.info("test_img2", &uuid)).?;
+defer info.free();
+
+std.debug.print("{any}\n", .{info.value()});
+
+// Removes object from the bucket
+try obj.remove("test_img2", uuid);
 ```
 
-Inserts the record only if the key does not exist.
+## Provisional Object Operation
 
 ```zig
-try redox.set("foo2", "bar2", .IfNotExists);
+// Creates a provisional object in the bucket
+const uuid = try obj.provision("test_img2", "prov.txt", 1024, &.{});
+std.debug.print("{s}\n", .{uuid});
+
+// Gets object info from the bucket
+var info = (try obj.info("test_img2", &uuid)).?;
+defer info.free();
+
+// Incrementally writes into the provisional object
+const rid = info2.value().rowid;
+var blob_writer = try obj.openStream("test_img2", rid);
+defer Sloop.Object.closeStream(&blob_writer);
+
+try Sloop.Object.incWrite(&blob_writer, "hello", 2);
+
+// Incrementally writes out of the provisional object
+var blob_reader = try obj.openStream("test_img2", rid);
+defer Sloop.Object.closeStream(&blob_reader);
+
+var buffer: [128]u8 = undefined;
+while(try Sloop.Object.incRead(&blob_reader, &buffer)) |data| {
+    std.debug.print("Chunk: {s}\n", .{data});
+}
 ```
-
-## Insert a New Record with Ttl
-
-Same as `redox.set()`, with an additional time-to-live (TTL) value in seconds. The record is automatically deleted after this period.
-
-```zig
-try redox.setWith("foo", "bar", .Default, 30);
-```
-
-## Extract a Record by the Given Key
-
-```zig
-const rec = try redox.get("foo");
-defer rec.free();
-std.debug.print("Value: {s}\n", .{rec.value()});
-```
-
-## Delete a Record by the Given Key
-
-```zig
-try redox.remove("foo2");
-```
-
-## Scan Partially Matched Keys
-
-```zig
-const keys = try redox.scan(heap, "foo:*", 10);
-defer Redox.Sync.free(heap, keys);
-
-for (keys) |key| { std.debug.print("key: {s}\n", .{key}); }
-```
-
-## Show Human-Readable Error Message
-
-Shows the most recent error that occurred on the HiRedis instance.
-
-```zig
-std.debug.print("Redis error: {s}\n", .{redox.errMsg()});
-```
-
-**Remarks:** Currently, only the string data structure is supported, and only the synchronous interface is implemented.

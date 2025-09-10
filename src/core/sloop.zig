@@ -7,11 +7,13 @@ const ArrayList = std.ArrayList;
 const Allocator = mem.Allocator;
 
 const quill = @import("quill");
+const Dt = quill.Types;
 const Uuid = quill.Uuid;
 const Quill = quill.Quill;
 const Qb = quill.QueryBuilder;
 const Builtins = quill.Builtins;
 const DateTime = quill.DateTime;
+const BlobStream = Quill.BlobStream;
 
 const schema = @import("./schema.zig");
 
@@ -77,7 +79,7 @@ const Bucket = struct {
     /// # Creates a New Object Container
     /// - `name` - Name of the object container (e.g., `user_img`)
     pub fn create(self: *Bucket, comptime name: Str) !void {
-        const sql = comptime Qb.Container.create(schema.Model, name, .Uuid);
+        const sql = comptime Qb.Container.create(schema.Model, name, .RowId);
         var result = try self.parent.storage.exec(sql);
         result.destroy();
     }
@@ -121,30 +123,34 @@ const Bucket = struct {
     }
 };
 
-const Object = struct {
+pub const Object = struct {
     parent: *Self,
 
+    /// # Puts a New Object into the Bucket
     /// - `c_name` - Name of the object container (e.g., `user_img`)
+    /// - `name` - Name of the object (e.g., `profile_img.jpg`)
+    /// - `data` - Octet data of the given object
+    /// - `owner` - Empty (e.g., `&.{}`) for public object
     pub fn put(
         self: *Object,
         comptime c_name: Str,
         name: Str,
         data: Str,
         owner: []const Str
-    ) ![16]u8 {
+    ) ![36]u8 {
         const sql = comptime blk: {
             var sql = Qb.Record.create(schema.Model, c_name, .Default);
             break :blk sql.statement();
         };
 
-        const uuid = Uuid.new();
+        const uuid = try Uuid.toUrn(&Uuid.new());
 
         const rec = schema.Model {
-            .uuid = .{.blob = &uuid},
+            .uuid = .{.text = &uuid},
             .name = .{.text = name},
             .data = .{.blob = data},
             .owned_by = .{.text = owner},
-            .prov = null,
+            .size = @intCast(data.len),
             .cat = DateTime.timestamp()
         };
 
@@ -155,45 +161,176 @@ const Object = struct {
         return uuid;
     }
 
-    // /// - `c_name` - Name of the object container (e.g., `user_img`)
-    // pub fn get(c_name: Str, uuid: Str) void {
+    /// # Retrieves the Object Data from the Bucket
+    /// - `c_name` - Name of the object container (e.g., `user_img`)
+    /// - `uuid` - UUID of the object
+    ///
+    /// **WARNING:** Return value must be freed by the caller.
+    pub fn get(self: *Object, comptime c_name: Str, uuid: Str) !?Str {
+        const sql = comptime blk: {
+            var sql = Qb.Record.find(schema.ViewData, schema.Filter, c_name);
+            sql.when(&.{sql.filter("uuid", .@"=", null)});
+            break :blk sql.statement();
+        };
 
-    // }
+        const filter = schema.Filter {.uuid = uuid};
 
-    // /// - `c_name` - Name of the object container (e.g., `user_img`)
-    // pub fn remove(c_name: Str, uuid: Str) void {
+        var crud = try self.parent.storage.prepare(sql);
+        defer crud.destroy();
 
-    // }
+        const result = try crud.readOne(schema.ViewData, filter);
+        defer crud.free(result);
 
-    // /// - `c_name` - Name of the object container (e.g., `user_img`)
-    // pub fn info(c_name: Str, uuid: Str) void {
-        
-    // }
+        if (result) |rec| {
+            const out = try self.parent.heap.alloc(u8, rec.data.len);
+            mem.copyForwards(u8, out, rec.data);
+            return out;
+        }
 
-    // /// - `c_name` - Name of the object container (e.g., `user_img`)
-    // pub fn provision(
-    //     size: usize,
-    //     c_name: Str,
-    //     name: Str,
-    //     data: Str,
-    //     owner: []const Str,
-    // ) void {
+        return null;
+    }
 
-    // }
+    /// # Removes the Object from the Bucket
+    /// - `c_name` - Name of the object container (e.g., `user_img`)
+    /// - `uuid` - UUID of the object
+    pub fn remove(self: *Object, comptime c_name: Str, uuid: Str) !void {
+        const sql = comptime blk: {
+            var sql = Qb.Record.remove(schema.Filter, c_name, .Exact);
+            sql.when(&.{sql.filter("uuid", .@"=", null)});
+            break :blk sql.statement();
+        };
 
-    // /// - `c_name` - Name of the object container (e.g., `user_img`)
-    // pub fn putPart(c_name: Str, uuid: Str) void {
+        const filter = schema.Filter {.uuid = uuid};
 
-    // }
+        var crud = try self.parent.storage.prepare(sql);
+        defer crud.destroy();
 
-    // /// - `c_name` - Name of the object container (e.g., `user_img`)
-    // pub fn getPart(c_name: Str, uuid: Str) void {
+        try crud.remove(filter, null);
+    }
 
-    // }
+    const Info = struct {
+        data: schema.ViewInfo,
+        crud: Quill.CRUD,
+
+        pub fn value(self: *const Info) schema.ViewInfo {
+            return self.data;
+        }
+
+        pub fn free(self: *Info) void {
+            return self.crud.free(self.data);
+        }
+    };
+
+    /// # Retrieves the Object Information from the Bucket
+    /// - `c_name` - Name of the object container (e.g., `user_img`)
+    /// - `uuid` - UUID of the object
+    ///
+    /// **WARNING:** Return value must be freed by calling `Info.free()`.
+    pub fn info(self: *Object, comptime c_name: Str, uuid: Str) !?Info {
+        const sql = comptime blk: {
+            var sql = Qb.Record.find(schema.ViewInfo, schema.Filter, c_name);
+            sql.when(&.{sql.filter("uuid", .@"=", null)});
+            break :blk sql.statement();
+        };
+
+        const filter = schema.Filter {.uuid = uuid};
+
+        var crud = try self.parent.storage.prepare(sql);
+        defer crud.destroy();
+
+        const result = try crud.readOne(schema.ViewInfo, filter);
+
+        if (result) |rec| { return .{.data = rec, .crud = crud }; }
+
+        crud.free(result);
+        return null;
+    }
+
+    /// # Provisions a New Object for Incremental I/O
+    /// - `c_name` - Name of the object container (e.g., `user_img`)
+    /// - `name` - Name of the object (e.g., `profile_img.jpg`)
+    /// - `size` - Provisional data size of the given object
+    /// - `owner` - Empty (e.g., `&.{}`) for public object
+    pub fn provision(
+        self: *Object,
+        comptime c_name: Str,
+        name: Str,
+        size: u32,
+        owner: []const Str,
+    ) ![36]u8 {
+        const sql = comptime blk: {
+            var sql = Qb.Record.create(schema.Model, c_name, .Default);
+            break :blk sql.statement();
+        };
+
+        const uuid = try Uuid.toUrn(&Uuid.new());
+
+        const rec = schema.ModelProvision {
+            .uuid = .{.text = &uuid},
+            .name = .{.text = name},
+            .data = .{.blob_len = @intCast(size)},
+            .owned_by = .{.text = owner},
+            .size = @intCast(size),
+            .cat = DateTime.timestamp()
+        };
+
+        var crud = try self.parent.storage.prepare(sql);
+        defer crud.destroy();
+
+        try crud.exec(rec, null, null);
+        return uuid;
+    }
+
+    /// # Opens Object Streaming
+    /// - `c_name` - Name of the object container (e.g., `user_img`)
+    /// - `rid` - RowId of the object
+    ///
+    /// **WARNING:** Return value must be freed by calling `closeStream()`
+    pub fn openStream(self: *Object, c_name: StrZ, rid: i64) !BlobStream {
+        return try BlobStream.open(
+            &self.parent.storage, c_name, "data", rid, .ReadWrite
+        );
+    }
+
+    /// # Closes Object Streaming
+    pub fn closeStream(blob: *BlobStream) void { blob.close(); }
+
+    /// # Writes Incremental Data to the Object
+    /// - `part` - Data fragment for incremental write
+    /// - `pos` - Offset position from where the part will be written
+    pub fn incWrite(stream: *BlobStream, part: Str, pos: usize) !void {
+        if (stream.size() < part.len) return error.FragmentTooBig;
+        if ((stream.size() - pos) < part.len) return error.InvalidOffset;
+
+        try stream.write(part, pos);
+    }
+
+    /// # Reads Incremental Data from the Object
+    /// - `part` - Data fragment for incremental read
+    /// - `pos` - Offset position from where the part will be written
+    pub fn incRead(stream: *BlobStream, part: []u8) !?Str {
+        if (stream.size() < part.len) return error.FragmentTooBig;
+        return try stream.read(part);
+    }
 };
 
-pub const Stream = struct {
+pub const StreamObject = struct {
     // TODO
+    // - make a schema for parted data upload such as VideoFrame
+    // - where rowID could be primary key and uuid as optional identifier
+    // - uuid should be same for multiple part with the cat timestamp
+    // - so we can aggregate the same fragment data in serial
+    // - also should have a cont: bool field so worker can know for sure
+    // - that the upload has completed
 
+    // - A worker or schedular could randomly peak a uuid and check cont
+    // - when cont is false means file has been fully uploaded
+    // - in such case worker will first gather the total size by data len
+    // - then, will create a provisional object by that size
+    // - will get each data fragment stream it to dest then remove the row
+
+    // - also we can make a job queue with uuid, priority, and status
+    // - use this uuid to upload multiple parts and then worker can query
+    // - this way no random uuid search will be needed
+    // - FYI, this worst cases, what could go wrong!
 };
-

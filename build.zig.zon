@@ -6,7 +6,7 @@
     .dependencies = .{
         .quill = .{
             .url = "https://github.com/bitlaab-bolt/quill/archive/refs/heads/main.zip",
-            .hash = "quill-0.5.0-JK-lza7GmACXO8xK8_-pMWXmF0WdhqNIPUWLsqO-ktUk",
+            .hash = "quill-0.5.0-JK-lzfjImADr13AdngPVGq7-4BSvYtVBvmmIF5P9Sojt",
         },
     },
     .paths = .{
