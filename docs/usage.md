@@ -81,7 +81,7 @@ defer Sloop.Object.closeStream(&blob_writer);
 
 try Sloop.Object.incWrite(&blob_writer, "hello", 2);
 
-// Incrementally writes out of the provisional object
+// Incrementally reads out of the provisional object
 var blob_reader = try obj.openStream("test_img2", rid);
 defer Sloop.Object.closeStream(&blob_reader);
 
