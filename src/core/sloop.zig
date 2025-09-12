@@ -21,6 +21,8 @@ const schema = @import("./schema.zig");
 const Str = []const u8;
 const StrZ = [:0]const u8;
 
+const Error = error { AccessDenied, MissingOwnership, NotFound, MissingEntity };
+
 heap: Allocator,
 storage: Quill,
 
@@ -130,13 +132,15 @@ pub const Object = struct {
     /// - `c_name` - Name of the object container (e.g., `user_img`)
     /// - `name` - Name of the object (e.g., `profile_img.jpg`)
     /// - `data` - Octet data of the given object
-    /// - `owner` - Empty (e.g., `&.{}`) for public object
+    /// - `owner` - One or more entity, (e.g., `&.{}`) for public uploads
+    /// - `access` - One or more entity, (e.g., `&.{}`) for public access
     pub fn put(
         self: *Object,
         comptime c_name: Str,
         name: Str,
         data: Str,
-        owner: []const Str
+        owner: []const Str,
+        access: []const Str
     ) ![36]u8 {
         const sql = comptime blk: {
             var sql = Qb.Record.create(schema.Model, c_name, .Default);
@@ -149,7 +153,8 @@ pub const Object = struct {
             .uuid = .{.text = &uuid},
             .name = .{.text = name},
             .data = .{.blob = data},
-            .owned_by = .{.text = owner},
+            .owner = .{.text = owner},
+            .access = .{.text = access},
             .size = @intCast(data.len),
             .cat = DateTime.timestamp()
         };
@@ -164,9 +169,17 @@ pub const Object = struct {
     /// # Retrieves the Object Data from the Bucket
     /// - `c_name` - Name of the object container (e.g., `user_img`)
     /// - `uuid` - UUID of the object
+    /// - `access` - Either an entity or **null** for public object
     ///
     /// **WARNING:** Return value must be freed by the caller.
-    pub fn get(self: *Object, comptime c_name: Str, uuid: Str) !?Str {
+    pub fn get(
+        self: *Object,
+        comptime c_name: Str,
+        uuid: Str,
+        access: ?Str
+    ) !Str {
+        try self.acl(c_name, uuid, access, false);
+
         const sql = comptime blk: {
             var sql = Qb.Record.find(schema.ViewData, schema.Filter, c_name);
             sql.when(&.{sql.filter("uuid", .@"=", null)});
@@ -181,19 +194,190 @@ pub const Object = struct {
         const result = try crud.readOne(schema.ViewData, filter);
         defer crud.free(result);
 
-        if (result) |rec| {
-            const out = try self.parent.heap.alloc(u8, rec.data.len);
-            mem.copyForwards(u8, out, rec.data);
-            return out;
+        const rec = result.?; // Result is guaranteed
+        const out = try self.parent.heap.alloc(u8, rec.data.len);
+        mem.copyForwards(u8, out, rec.data);
+        return out;
+    }
+
+    /// # Adds Owner to an Object
+    /// - `c_name` - Name of the object container (e.g., `user_img`)
+    /// - `uuid` - UUID of the object
+    /// - `owner` - Existing owner entity string
+    /// - `entity` - New owner entity string
+    pub fn addOwner(
+        self: *Object,
+        comptime c_name: Str,
+        uuid: Str,
+        owner: Str,
+        entity: Str,
+    ) !void {
+        var obj_info = try self.info(c_name, uuid, owner);
+        defer obj_info.free();
+
+        var list = ArrayList(Str).init(self.parent.heap);
+        defer list.deinit();
+
+        for (obj_info.value().owner) |v| try list.append(v);
+        try list.append(entity);
+
+        const sql = comptime blk: {
+            var sql = Qb.Record.update(
+                schema.ModelOwner, schema.Filter, c_name, .Exact
+            );
+
+            sql.when(&.{sql.filter("uuid", .@"=", null)});
+            break :blk sql.statement();
+        };
+
+        const filter = schema.Filter {.uuid = uuid};
+        const new_owner = schema.ModelOwner {.owner = .{.text = list.items}};
+
+        var crud = try self.parent.storage.prepare(sql);
+        defer crud.destroy();
+
+        try crud.exec(new_owner, filter, null);
+    }
+
+    /// # Removes Owner from an Object
+    /// - `c_name` - Name of the object container (e.g., `user_img`)
+    /// - `uuid` - UUID of the object
+    /// - `owner` - Existing owner entity string
+    /// - `entity` - Existing owner entity string
+    pub fn removeOwner(
+        self: *Object,
+        comptime c_name: Str,
+        uuid: Str,
+        owner: Str,
+        entity: Str,
+    ) !void {
+        var obj_info = try self.info(c_name, uuid, owner);
+        defer obj_info.free();
+
+        var list = ArrayList(Str).init(self.parent.heap);
+        defer list.deinit();
+
+        var found: bool = false;
+        for (obj_info.value().owner) |v| {
+            if (!mem.eql(u8, v, entity)) try list.append(v)
+            else found = true;
         }
 
-        return null;
+        if (!found) return Error.MissingEntity;
+
+        const sql = comptime blk: {
+            var sql = Qb.Record.update(
+                schema.ModelOwner, schema.Filter, c_name, .Exact
+            );
+
+            sql.when(&.{sql.filter("uuid", .@"=", null)});
+            break :blk sql.statement();
+        };
+
+        const filter = schema.Filter {.uuid = uuid};
+        const new_owner = schema.ModelOwner {.owner = .{.text = list.items}};
+
+        var crud = try self.parent.storage.prepare(sql);
+        defer crud.destroy();
+
+        try crud.exec(new_owner, filter, null);
+    }
+
+    /// # Adds Access to an Object
+    /// - `c_name` - Name of the object container (e.g., `user_img`)
+    /// - `uuid` - UUID of the object
+    /// - `owner` - Existing owner entity string
+    /// - `entity` - New access entity string
+    pub fn addAccess(
+        self: *Object,
+        comptime c_name: Str,
+        uuid: Str,
+        owner: Str,
+        entity: Str,
+    ) !void {
+        var obj_info = try self.info(c_name, uuid, owner);
+        defer obj_info.free();
+
+        var list = ArrayList(Str).init(self.parent.heap);
+        defer list.deinit();
+
+        for (obj_info.value().access) |v| try list.append(v);
+        try list.append(entity);
+
+        const sql = comptime blk: {
+            var sql = Qb.Record.update(
+                schema.ModelAccess, schema.Filter, c_name, .Exact
+            );
+
+            sql.when(&.{sql.filter("uuid", .@"=", null)});
+            break :blk sql.statement();
+        };
+
+        const filter = schema.Filter {.uuid = uuid};
+        const new_access = schema.ModelAccess {.access = .{.text = list.items}};
+
+        var crud = try self.parent.storage.prepare(sql);
+        defer crud.destroy();
+
+        try crud.exec(new_access, filter, null);
+    }
+
+    /// # Removes Access from an Object
+    /// - `c_name` - Name of the object container (e.g., `user_img`)
+    /// - `uuid` - UUID of the object
+    /// - `owner` - Existing owner entity string
+    /// - `entity` - Existing access entity string
+    pub fn removeAccess(
+        self: *Object,
+        comptime c_name: Str,
+        uuid: Str,
+        owner: Str,
+        entity: Str,
+    ) !void {
+        var obj_info = try self.info(c_name, uuid, owner);
+        defer obj_info.free();
+
+        var list = ArrayList(Str).init(self.parent.heap);
+        defer list.deinit();
+
+        var found: bool = false;
+        for (obj_info.value().access) |v| {
+            if (!mem.eql(u8, v, entity)) try list.append(v)
+            else found = true;
+        }
+
+        if (!found) return Error.MissingEntity;
+
+        const sql = comptime blk: {
+            var sql = Qb.Record.update(
+                schema.ModelAccess, schema.Filter, c_name, .Exact
+            );
+
+            sql.when(&.{sql.filter("uuid", .@"=", null)});
+            break :blk sql.statement();
+        };
+
+        const filter = schema.Filter {.uuid = uuid};
+        const new_access = schema.ModelAccess {.access = .{.text = list.items}};
+
+        var crud = try self.parent.storage.prepare(sql);
+        defer crud.destroy();
+
+        try crud.exec(new_access, filter, null);
     }
 
     /// # Removes the Object from the Bucket
     /// - `c_name` - Name of the object container (e.g., `user_img`)
     /// - `uuid` - UUID of the object
-    pub fn remove(self: *Object, comptime c_name: Str, uuid: Str) !void {
+    /// - `access` - Either an entity or **null** for public object
+    pub fn remove(
+        self: *Object,
+        comptime c_name: Str,
+        uuid: Str,
+        access: ?Str
+    ) !void {
+        try self.acl(c_name, uuid, access, true);
+
         const sql = comptime blk: {
             var sql = Qb.Record.remove(schema.Filter, c_name, .Exact);
             sql.when(&.{sql.filter("uuid", .@"=", null)});
@@ -224,9 +408,17 @@ pub const Object = struct {
     /// # Retrieves the Object Information from the Bucket
     /// - `c_name` - Name of the object container (e.g., `user_img`)
     /// - `uuid` - UUID of the object
+    /// - `access` - Either an entity or **null** for public object
     ///
     /// **WARNING:** Return value must be freed by calling `Info.free()`.
-    pub fn info(self: *Object, comptime c_name: Str, uuid: Str) !?Info {
+    pub fn info(
+        self: *Object,
+        comptime c_name: Str,
+        uuid: Str,
+        access: ?Str
+    ) !Info {
+        try self.acl(c_name, uuid, access, true);
+
         const sql = comptime blk: {
             var sql = Qb.Record.find(schema.ViewInfo, schema.Filter, c_name);
             sql.when(&.{sql.filter("uuid", .@"=", null)});
@@ -239,24 +431,64 @@ pub const Object = struct {
         defer crud.destroy();
 
         const result = try crud.readOne(schema.ViewInfo, filter);
+        errdefer crud.free(result);
 
-        if (result) |rec| { return .{.data = rec, .crud = crud }; }
+        return if (result) |rec| .{.data = rec, .crud = crud }
+        else Error.NotFound;
+    }
 
-        crud.free(result);
-        return null;
+    /// # Access Control List Validator
+    fn acl(
+        self: *Object,
+        comptime c_name: Str,
+        uuid: Str,
+        access: ?Str,
+        owner_only: bool
+    ) !void {
+        const sql = comptime blk: {
+            var sql = Qb.Record.find(schema.ViewInfo, schema.Filter, c_name);
+            sql.when(&.{sql.filter("uuid", .@"=", null)});
+            break :blk sql.statement();
+        };
+
+        const filter = schema.Filter {.uuid = uuid};
+
+        var crud = try self.parent.storage.prepare(sql);
+        defer crud.destroy();
+
+        const result = try crud.readOne(schema.ViewInfo, filter);
+        defer crud.free(result);
+
+        if (result) |rec| {
+            if (access) |v| {
+                for (rec.owner) |name| if (mem.eql(u8, v, name)) return;
+
+                if (!owner_only) {
+                    for (rec.access) |name| if (mem.eql(u8, v, name)) return;
+                }
+            } else {
+                if (rec.owner.len == 0 and rec.access.len == 0) return;
+            }
+
+            return Error.AccessDenied;
+        }
+
+        return Error.NotFound;
     }
 
     /// # Provisions a New Object for Incremental I/O
     /// - `c_name` - Name of the object container (e.g., `user_img`)
     /// - `name` - Name of the object (e.g., `profile_img.jpg`)
     /// - `size` - Provisional data size of the given object
-    /// - `owner` - Empty (e.g., `&.{}`) for public object
+    /// - `owner` - One or more entity, (e.g., `&.{}`) for public uploads
+    /// - `access` - One or more entity, (e.g., `&.{}`) for public access
     pub fn provision(
         self: *Object,
         comptime c_name: Str,
         name: Str,
         size: u32,
         owner: []const Str,
+        access: []const Str,
     ) ![36]u8 {
         const sql = comptime blk: {
             var sql = Qb.Record.create(schema.Model, c_name, .Default);
@@ -269,7 +501,8 @@ pub const Object = struct {
             .uuid = .{.text = &uuid},
             .name = .{.text = name},
             .data = .{.blob_len = @intCast(size)},
-            .owned_by = .{.text = owner},
+            .owner = .{.text = owner},
+            .access = .{.text = access},
             .size = @intCast(size),
             .cat = DateTime.timestamp()
         };
@@ -284,9 +517,19 @@ pub const Object = struct {
     /// # Opens Object Streaming
     /// - `c_name` - Name of the object container (e.g., `user_img`)
     /// - `rid` - RowId of the object
+    /// - `uuid` - UUID of the object
+    /// - `access` - Either an entity or **null** for public object
     ///
     /// **WARNING:** Return value must be freed by calling `closeStream()`
-    pub fn openStream(self: *Object, c_name: StrZ, rid: i64) !BlobStream {
+    pub fn openStream(
+        self: *Object,
+        comptime c_name: StrZ,
+        rid: i64,
+        uuid: Str,
+        access: ?Str
+    ) !BlobStream {
+        try self.acl(c_name, uuid, access, false);
+
         return try BlobStream.open(
             &self.parent.storage, c_name, "data", rid, .ReadWrite
         );
