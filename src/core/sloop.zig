@@ -95,8 +95,10 @@ const Bucket = struct {
     /// # Retrieves Object Container Names
     /// **WARNING:** Return value must be freed by calling `freeList()`.
     pub fn list(self: *Bucket) ![]const Str {
-        var tables = ArrayList(Str).init(self.parent.heap);
-        errdefer tables.deinit();
+        const heap = self.parent.heap;
+
+        var tables = ArrayList(Str){};
+        errdefer tables.deinit(heap);
 
         const sql = "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%';";
 
@@ -106,16 +108,16 @@ const Bucket = struct {
         while (true) {
             if (result.next()) |col| {
                 const data = col[0].data;
-                const item = try self.parent.heap.alloc(u8, data.len);
+                const item = try heap.alloc(u8, data.len);
                 mem.copyForwards(u8, item, data);
-                try tables.append(item);
+                try tables.append(heap, item);
                 continue;
             }
 
             break;
         }
 
-        return try tables.toOwnedSlice();
+        return try tables.toOwnedSlice(heap);
     }
 
     /// # Frees the Object Container Names
@@ -212,14 +214,16 @@ pub const Object = struct {
         owner: Str,
         entity: Str,
     ) !void {
+        const heap = self.parent.heap;
+
         var obj_info = try self.info(c_name, uuid, owner);
         defer obj_info.free();
 
-        var list = ArrayList(Str).init(self.parent.heap);
-        defer list.deinit();
+        var list = ArrayList(Str){};
+        defer list.deinit(heap);
 
         for (obj_info.value().owner) |v| try list.append(v);
-        try list.append(entity);
+        try list.append(heap, entity);
 
         const sql = comptime blk: {
             var sql = Qb.Record.update(
@@ -251,15 +255,17 @@ pub const Object = struct {
         owner: Str,
         entity: Str,
     ) !void {
+        const heap = self.parent.heap;
+
         var obj_info = try self.info(c_name, uuid, owner);
         defer obj_info.free();
 
-        var list = ArrayList(Str).init(self.parent.heap);
-        defer list.deinit();
+        var list = ArrayList(Str){};
+        defer list.deinit(heap);
 
         var found: bool = false;
         for (obj_info.value().owner) |v| {
-            if (!mem.eql(u8, v, entity)) try list.append(v)
+            if (!mem.eql(u8, v, entity)) try list.append(heap, v)
             else found = true;
         }
 
@@ -295,14 +301,16 @@ pub const Object = struct {
         owner: Str,
         entity: Str,
     ) !void {
+        const heap = self.parent.heap;
+
         var obj_info = try self.info(c_name, uuid, owner);
         defer obj_info.free();
 
-        var list = ArrayList(Str).init(self.parent.heap);
-        defer list.deinit();
+        var list = ArrayList(Str){};
+        defer list.deinit(heap);
 
         for (obj_info.value().access) |v| try list.append(v);
-        try list.append(entity);
+        try list.append(heap, entity);
 
         const sql = comptime blk: {
             var sql = Qb.Record.update(
@@ -334,15 +342,17 @@ pub const Object = struct {
         owner: Str,
         entity: Str,
     ) !void {
+        const heap = self.parent.heap;
+
         var obj_info = try self.info(c_name, uuid, owner);
         defer obj_info.free();
 
-        var list = ArrayList(Str).init(self.parent.heap);
-        defer list.deinit();
+        var list = ArrayList(Str){};
+        defer list.deinit(heap);
 
         var found: bool = false;
         for (obj_info.value().access) |v| {
-            if (!mem.eql(u8, v, entity)) try list.append(v)
+            if (!mem.eql(u8, v, entity)) try list.append(heap, v)
             else found = true;
         }
 
