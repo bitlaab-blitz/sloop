@@ -1,12 +1,12 @@
 .{
     .name = .sloop,
-    .version = "1.1.0",
+    .version = "1.1.1",
     .fingerprint = 0xf84baff04b4bbbd1,
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
         .quill = .{
-            .url = "https://github.com/bitlaab-bolt/quill/archive/refs/heads/main.zip",
-            .hash = "quill-0.6.0-JK-lzWjJmABcpHpfSFWjuv6MiLpnvZL-JRXvWYRd4DMz",
+            .url = "https://github.com/bitlaab-bolt/quill/archive/refs/tags/v1.0.0.zip",
+            .hash = "quill-1.0.0-JK-lzUjamADYrLE-SzoszEo6BJQdo-xSZH2WDEprHV9A",
         },
     },
     .paths = .{

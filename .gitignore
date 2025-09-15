@@ -4,4 +4,4 @@
 zig-out/
 site/
 
-bucket.db
+*.db
