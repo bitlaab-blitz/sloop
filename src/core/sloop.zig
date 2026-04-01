@@ -59,7 +59,7 @@ pub fn setIndex(self: *Self) !void {
 
     for (items) |item| {
         const fmt_str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_uuid ON {s}(\"uuid\");";
-        const sql = try fmt.allocPrint(self.heap, fmt_str, .{item});
+        const sql = try fmt.allocPrintSentinel(self.heap, fmt_str, .{item}, 0);
         defer self.heap.free(sql);
 
         var result = try self.storage.exec(sql);

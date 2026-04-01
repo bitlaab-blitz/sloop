@@ -22,6 +22,11 @@ Here we write upgrading notes and make them as straightforward as possible.
 - A short description for fixed item 2
 - A short description for fixed item n
 
+
+## [v1.2.1] - 2026-04-01
+
+Sentinel string BUG fix on `setIndex()` for **malloc** to work.
+
 ## [v1.2.0] - 2026-02-22
 
 Updated Quill dependency to v1.1.0
