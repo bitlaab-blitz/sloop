@@ -15,9 +15,24 @@ var gpa_mem = std.heap.DebugAllocator(.{}).init;
 defer std.debug.assert(gpa_mem.deinit() == .ok);
 const heap = gpa_mem.allocator();
 
-var sloop = try Sloop.init(heap, "bucket.db", 32);
+// Single-threaded process — `.SingleThreaded` skips per-call SQLite mutexes.
+// Use `.Serialized` (or `.MultiThreaded`) when sharing instances across threads.
+var sloop = try Sloop.init(init.io, heap, "bucket.db", .SingleThreaded, 32);
 try sloop.setIndex();
 defer sloop.deinit();
+```
+
+Passing `null` instead of a path creates an in-memory storage:
+
+```zig
+var sloop = try Sloop.init(init.io, heap, null, .SingleThreaded, 32);
+```
+
+A full consistency check of the storage file can be run at any time. It is an
+O(database size) operation — typically run once on startup or periodically:
+
+```zig
+try sloop.checkIntegrity();
 ```
 
 ## Bucket Operations
@@ -45,13 +60,13 @@ var obj = sloop.object();
 // Puts object in the bucket
 
 // Private object
-const uuid = try obj.put("test_img2", "pub.txt", "Private, world!",
+const uuid = try obj.put("test_img2", "note.txt", "Private, world!",
     &.{"john", "doe"}, &.{}
 );
 std.debug.print("{s}\n", .{uuid});
 
 // Public object
-const uuid2 = try obj.put("test_img2", "priv.txt", "Public, world!",
+const uuid2 = try obj.put("test_img2", "readme.txt", "Public, world!",
     &.{}, &.{}
 );
 std.debug.print("{s}\n", .{uuid2});
@@ -66,15 +81,15 @@ const out = try obj.get("test_img2", &uuid, "jake");
 defer heap.free(out);
 std.debug.print("{s}\n", .{out});
 
-// Removes an entity to the access list
+// Removes an entity from the access list
 try obj.removeAccess("test_img2", &uuid, "john", "soul");
 
 // Adds an entity to the owner list
 try obj.addOwner("test_img2", &uuid, "john", "foo");
 try obj.addOwner("test_img2", &uuid, "foo", "bar");
-try obj.addOwner("test_img2", &uuid, "foo", "baz");
+try obj.addOwner("docs2", &uuid, "foo", "baz");
 
-// Removes an entity to the owner list
+// Removes an entity from the owner list
 try obj.removeOwner("test_img2", &uuid, "foo", "bar");
 try obj.removeOwner("test_img2", &uuid, "baz", "baz");
 
@@ -105,10 +120,13 @@ try obj.remove("test_img2", &uuid2, null);
 
 **NOTE:**
 
-- Adding or removing owner or access entity is not allows for public object.
+- Adding or removing owner or access entity is not allowed for public object.
 - An object is deemed public when owner and access list is empty
 - Only owner is allowed to get object info for private object
 - An owner can remove itself from the list
+- Removing the last owner is refused (`MissingOwnership`) to keep the object
+  manageable
+- Adding an entity that is already present is a no-op
 
 ## Provisional Object Operation
 
@@ -129,15 +147,17 @@ std.debug.print("{s}\n", .{uuid2});
 var info = try obj.info("test_img1", &uuid, "john");
 defer info.free();
 
-// Incrementally writes into the provisional object
+// Incrementally writes into the provisional object — streams open as
+// Read-Write only for owners
 const rid = info.value().rowid;
-var blob_writer = try obj.openStream("test_img1", rid, &uuid, "jane");
+var blob_writer = try obj.openStream("test_img1", rid, &uuid, "john");
 defer Sloop.Object.closeStream(&blob_writer);
 
 try Sloop.Object.incWrite(&blob_writer, "hello", 2);
 
-// Incrementally reads out of the provisional object
-var blob_reader = try obj.openStream("test_img1", rid, &uuid, "john");
+// Incrementally reads out of the provisional object — access entities and
+// public objects open Read-Only streams
+var blob_reader = try obj.openStream("test_img1", rid, &uuid, "jane");
 defer Sloop.Object.closeStream(&blob_reader);
 
 var buffer: [128]u8 = undefined;
@@ -150,3 +170,29 @@ while(try Sloop.Object.incRead(&blob_reader, &buffer)) |data| {
 
 - You can also perform incremental I/O on a non-provisioned object
 - Owner and access control operation works same as non-provisioned object
+- Streams open as **Read-Write** only for owners; access entities and public
+  objects get **Read-Only** streams — writes through them fail
+
+## Scanning Object Containers
+
+```zig
+// Progressive cursor over every record of the container
+var cursor = try bucket.scan("test_img1");
+defer cursor.close(); // Must be closed, even on early loop exits
+
+while (try cursor.next()) |row| {
+    defer row.free(); // Must be freed, even on early loop exits
+
+    const row_info = row.value();
+    std.debug.print("{s} | {s} | {d} bytes\n", .
+        {row_info.uuid, row_info.name, row_info.size});
+}
+```
+
+**NOTE:**
+
+- Rows are yielded in implicit `rowid` order
+- Each row excludes the `data` blob and the JSON `owner`/`access` fields for
+  cheap iteration; use `obj.info()` for the full record
+- Breaking out of the loop early is fine as long as the cursor is closed and
+  consumed rows are freed

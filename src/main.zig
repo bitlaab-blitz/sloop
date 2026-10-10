@@ -1,8 +1,4 @@
 const std = @import("std");
-const crypto = std.crypto;
-const fmt = std.fmt;
-const mem = std.mem;
-const Allocator = std.mem.Allocator;
 
 const Sloop = @import("sloop").Sloop;
 
@@ -12,12 +8,15 @@ pub fn main(init: std.process.Init) !void {
     defer std.debug.assert(gpa_mem.deinit() == .ok);
     const heap = gpa_mem.allocator();
 
-    // Write your code here..
-
-    // Single-threaded demo process — skips per-call SQLite mutexes
+    // Single-threaded demo process — skips per-call SQLite mutexes.
+    // Pass `.Serialized` (or `.MultiThreaded`) when sharing across threads
     var sloop = try Sloop.init(init.io, heap, "bucket.db", .SingleThreaded, 32);
     try sloop.setIndex();
     defer sloop.deinit();
+
+    // Full consistency check of the storage file (O(database size)) —
+    // typically run once on startup or from a periodic maintenance job
+    try sloop.checkIntegrity();
 
     var bucket = sloop.bucket();
 
@@ -52,22 +51,36 @@ pub fn main(init: std.process.Init) !void {
     );
     std.debug.print("{s}\n", .{uuid});
 
-    // public object
+    // Public object
     const uuid2 = try obj.provision("test_img1", "prov.txt", 1024, &.{}, &.{});
     std.debug.print("{s}\n", .{uuid2});
 
     // Gets object info from the bucket
+
+    // Private object — only owners are permitted
     var info = try obj.info("test_img1", &uuid, "john");
     defer info.free();
 
-    // Incrementally writes into the provisional object (owner stream)
+    std.debug.print("Info: {s} | {d} bytes\n", .
+        {info.value().name, info.value().size});
+
+    // Public object — readable without an entity
+    var info2 = try obj.info("test_img1", &uuid2, null);
+    defer info2.free();
+
+    std.debug.print("Info: {s} | {d} bytes\n", .
+        {info2.value().name, info2.value().size});
+
+    // Incrementally writes into the provisional object (owner stream —
+    // owners hold read-write streams)
     const rid = info.value().rowid;
     var blob_writer = try obj.openStream("test_img1", rid, &uuid, "john");
     defer Sloop.Object.closeStream(&blob_writer);
 
     try Sloop.Object.incWrite(&blob_writer, "hello", 2);
 
-    // Incrementally reads out of the provisional object (access stream)
+    // Incrementally reads out of the provisional object (access stream —
+    // access entities hold read-only streams)
     var blob_reader = try obj.openStream("test_img1", rid, &uuid, "jane");
     defer Sloop.Object.closeStream(&blob_reader);
 
@@ -88,6 +101,13 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("ERROR: last owner was removed!\n", .{});
     } else |err| {
         std.debug.print("Refused: {s}\n", .{@errorName(err)});
+    }
+
+    // Access is denied for entities outside the owner and access lists
+    if (obj.get("test_img1", &uuid, "mallory")) |_| {
+        std.debug.print("ERROR: stranger read a private object!\n", .{});
+    } else |err| {
+        std.debug.print("Denied for mallory: {s}\n", .{@errorName(err)});
     }
 
     // Scans the object container (progressive row cursor)
