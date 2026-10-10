@@ -36,13 +36,28 @@ pub const ModelAccess = struct {
     access: Dt.CastInto(.Text, []const Dt.Slice)
 };
 
-pub const ViewData = struct { data: Dt.Slice };
+pub const ViewData = struct {
+    data: Dt.Slice,
+    owner: Dt.Any([]const Dt.Slice),
+    access: Dt.Any([]const Dt.Slice)
+};
 
 pub const ViewInfo = struct {
     rowid: Dt.Int,
     name: Dt.Slice,
     owner: Dt.Any([]const Dt.Slice),
     access: Dt.Any([]const Dt.Slice),
+    size: Dt.Int,
+    cat: Dt.Int
+};
+
+/// # Lean Scan View for Container Enumeration
+/// **Remarks:** Excludes `data` (blob) and `owner`/`access` (JSON) fields
+/// keeping per-row retrieval cheap; use `ViewInfo` for the full record
+pub const ViewScan = struct {
+    rowid: Dt.Int,
+    uuid: Dt.Slice,
+    name: Dt.Slice,
     size: Dt.Int,
     cat: Dt.Int
 };
