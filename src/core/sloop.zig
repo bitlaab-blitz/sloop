@@ -1,6 +1,7 @@
 //! # Simple Bucket Storage
 
 const std = @import("std");
+const Io = std.Io;
 const fmt = std.fmt;
 const mem = std.mem;
 const ArrayList = std.ArrayList;
@@ -23,6 +24,7 @@ const StrZ = [:0]const u8;
 
 const Error = error { AccessDenied, MissingOwnership, NotFound, MissingEntity };
 
+io: Io,
 heap: Allocator,
 storage: Quill,
 
@@ -31,7 +33,7 @@ const Self = @This();
 /// # Initializes Sloop with Default Configuration
 /// - `path` - Bucket storage file path (e.g., `bucket.db`)
 /// - `cache` - Underlying storage engine cache size in MB
-pub fn init(heap: Allocator, path: StrZ, comptime cache: u16) !Self {
+pub fn init(io: Io, heap: Allocator, path: StrZ, comptime cache: u16) !Self {
     try Quill.init(.Serialized);
 
     var db = try Quill.open(heap, path, .All);
@@ -42,7 +44,7 @@ pub fn init(heap: Allocator, path: StrZ, comptime cache: u16) !Self {
     try Builtins.Pragma.setSynchronous(&db, .NORMAL);
     try Builtins.Pragma.setCache(&db, -(@as(i32, cache) * 1024));
 
-    return .{.heap = heap, .storage = db};
+    return .{.io = io, .heap = heap, .storage = db};
 }
 
 /// # Destroys the Sloop Instance
@@ -97,7 +99,7 @@ const Bucket = struct {
     pub fn list(self: *Bucket) ![]const Str {
         const heap = self.parent.heap;
 
-        var tables = ArrayList(Str){};
+        var tables: ArrayList(Str) = .empty;
         errdefer tables.deinit(heap);
 
         const sql = "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%';";
@@ -505,7 +507,7 @@ pub const Object = struct {
             break :blk sql.statement();
         };
 
-        const uuid = try Uuid.toUrn(&Uuid.new());
+        const uuid = try Uuid.toUrn(&(try Uuid.new(self.parent.io)));
 
         const rec = schema.ModelProvision {
             .uuid = .{.text = &uuid},
@@ -514,7 +516,7 @@ pub const Object = struct {
             .owner = .{.text = owner},
             .access = .{.text = access},
             .size = @intCast(size),
-            .cat = DateTime.timestamp()
+            .cat = DateTime.timestamp(self.parent.io)
         };
 
         var crud = try self.parent.storage.prepare(sql);

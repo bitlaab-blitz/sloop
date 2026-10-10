@@ -7,14 +7,14 @@ const Allocator = std.mem.Allocator;
 const Sloop = @import("sloop").Sloop;
 
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var gpa_mem = std.heap.DebugAllocator(.{}).init;
     defer std.debug.assert(gpa_mem.deinit() == .ok);
     const heap = gpa_mem.allocator();
 
     // Write your code here..
 
-    var sloop = try Sloop.init(heap, "bucket.db", 32);
+    var sloop = try Sloop.init(init.io, heap, "bucket.db", 32);
     try sloop.setIndex();
     defer sloop.deinit();
 

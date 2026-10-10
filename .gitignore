@@ -5,3 +5,5 @@ zig-out/
 site/
 
 *.db
+
+zig-pkg/

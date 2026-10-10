@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
 
     switch (target.query.os_tag orelse builtin.os.tag) {
         .macos => {},
-        .windows, .linux => exe.linkLibC(),
+        .windows, .linux => exe.root_module.link_libc = true,
         else => @panic("Codebase is not tailored for this platform!")
     }
 

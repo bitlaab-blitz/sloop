@@ -6,16 +6,16 @@ Sloop is a lightweight, standalone bucket storage system written entirely in Zig
 
 ## Platform Support
 
-Sloop has cross-platform support.
+Fully cross-platform.
 
 ## Dependency
 
-Sloop has the following external dependency:
+Has the following external dependency:
 
-- [Quill](https://bitlaabquill.web.app/)
+- [Quill](https://bitlaab.com/api-doc?pkg=quill)
 
 No additional step is required to use this project as a package dependency.
 
 ## Documentation
 
-For most up-to-date documentation see - [**Sloop Documentation**](https://bitlaabsloop.web.app/).
+For most up-to-date documentation see - [**Sloop Documentation**](https://bitlaab.com/api-doc?pkg=sloop).
