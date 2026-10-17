@@ -1,8 +1,6 @@
 //! # Bucket Storage Schema
 //! - Provides an entry point for all record structures.
 
-const std = @import("std");
-
 const quill = @import("quill");
 const Dt = quill.Types;
 

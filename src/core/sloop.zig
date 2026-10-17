@@ -8,7 +8,6 @@ const ArrayList = std.ArrayList;
 const Allocator = mem.Allocator;
 
 const quill = @import("quill");
-const Dt = quill.Types;
 const Uuid = quill.Uuid;
 const Quill = quill.Quill;
 const Qb = quill.QueryBuilder;
