@@ -17,13 +17,13 @@ const BlobStream = Quill.BlobStream;
 
 const schema = @import("./schema.zig");
 
-const DbOption = quill.Native.sqlite3.Option;
-
 
 const Str = []const u8;
 const StrZ = [:0]const u8;
 
-const Error = error { AccessDenied, MissingOwnership, NotFound, MissingEntity };
+const Error = error {
+    AccessDenied, MissingOwnership, NotFound, MissingEntity, PoolClosed
+};
 
 /// # Identifies a Pre-parable Statement for a Container
 const Stmt = enum {
@@ -31,8 +31,9 @@ const Stmt = enum {
 };
 
 /// # Lazily Prepared Statements of an Object Container
-/// **Remarks:** Compiled once per container and reused across operations
-/// (quill's `CRUD` recycles the statement automatically on every operation).
+/// **Remarks:** Compiled once per connection and container, and reused
+/// across operations (quill's `CRUD` recycles the statement automatically
+/// on every operation)
 const StmtCache = struct {
     find_info: ?Quill.CRUD = null,
     find_data: ?Quill.CRUD = null,
@@ -44,134 +45,304 @@ const StmtCache = struct {
 
 io: Io,
 heap: Allocator,
-storage: Quill,
-caches: std.StringHashMap(StmtCache),
+shared: *Shared,
 
 const Self = @This();
+
+/// # Synchronization State of the Connection Pool
+/// **Remarks:** Heap-allocated so pooled connections can hold a stable
+/// pointer back to the pool regardless of where the `Self` handle lives
+const Shared = struct {
+    mutex: Io.Mutex = Io.Mutex.init,
+    signal: Io.Condition = Io.Condition.init,
+    pool: []Conn = &.{},
+    free_list: []usize = &.{},
+    top: usize = 0,
+    closing: bool = false,
+
+    /// # Takes an Exclusive Connection Out of the Pool
+    /// **Remarks:** Parks the caller while every connection is checked out.
+    /// A connection must never be acquired twice within one operation —
+    /// nesting deadlocks the pool once every connection is out.
+    /// Returns `PoolClosed` once `close()` has run, unwinding the caller so
+    /// a shutdown signal never strands a parked worker
+    fn acquire(self: *Shared, io: Io) Error!*Conn {
+        self.mutex.lockUncancelable(io);
+
+        while (self.top == 0 and !self.closing) {
+            self.signal.waitUncancelable(io, &self.mutex);
+        }
+
+        if (self.closing) {
+            self.mutex.unlock(io);
+            return Error.PoolClosed;
+        }
+
+        self.top -= 1;
+        const conn = &self.pool[self.free_list[self.top]];
+        self.mutex.unlock(io);
+        return conn;
+    }
+
+    /// # Returns a Connection Back to the Pool
+    fn release(self: *Shared, io: Io, conn: *Conn) void {
+        self.mutex.lockUncancelable(io);
+
+        self.free_list[self.top] = conn.idx;
+        self.top += 1;
+        self.signal.signal(io);
+
+        self.mutex.unlock(io);
+    }
+
+    /// # Stops the Pool: Every Future Acquisition Fails with `PoolClosed`
+    /// **Remarks:** Broadcasts so every parked acquirer wakes and unwinds —
+    /// connections already checked out keep working until they are released
+    fn close(self: *Shared, io: Io) void {
+        self.mutex.lockUncancelable(io);
+
+        self.closing = true;
+        self.signal.broadcast(io);
+
+        self.mutex.unlock(io);
+    }
+};
+
+/// # Pooled Storage Connection with its Own Statement Cache
+/// **Remarks:** The connection is exclusively owned between checkout and
+/// release, so its statement cache is used without any synchronization.
+/// Since sloop operations never suspend, an operation always runs to
+/// completion on the connection it checked out — even when the underlying
+/// scheduler migrates the request between worker threads
+const Conn = struct {
+    db: Quill,
+    heap: Allocator,
+    shared: *Shared,
+    io: Io,
+    idx: usize,
+    caches: std.StringHashMap(StmtCache),
+
+    /// # Returns the Connection Back to its Pool
+    fn release(self: *Conn) void {
+        self.shared.release(self.io, self);
+    }
+
+    /// # Returns the Prepared Statement Interface for the Given Operation
+    /// **Remarks:** Statements are compiled once per connection and container
+    /// and kept alive for reuse — quill's `CRUD` recycles the statement
+    /// automatically on every operation, removing the per-call recompilation
+    /// cost. The cache is only touched while the connection is checked out,
+    /// so no synchronization is needed here
+    fn stmt(self: *Conn, comptime kind: Stmt, comptime c_name: Str) !*Quill.CRUD {
+        const sql = comptime switch (kind) {
+            .find_info => blk: {
+                var sql = Qb.Record.find(schema.ViewInfo, schema.Filter, c_name);
+                sql.when(&.{sql.filter("uuid", .@"=", null)});
+                break :blk sql.statement();
+            },
+            .find_data => blk: {
+                var sql = Qb.Record.find(schema.ViewData, schema.Filter, c_name);
+                sql.when(&.{sql.filter("uuid", .@"=", null)});
+                break :blk sql.statement();
+            },
+            .insert => blk: {
+                var sql = Qb.Record.create(schema.Model, c_name, .Default);
+                break :blk sql.statement();
+            },
+            .remove => blk: {
+                var sql = Qb.Record.remove(schema.Filter, c_name, .Exact);
+                sql.when(&.{sql.filter("uuid", .@"=", null)});
+                break :blk sql.statement();
+            },
+            .update_owner => blk: {
+                var sql = Qb.Record.update(
+                    schema.ModelOwner, schema.Filter, c_name, .Exact
+                );
+
+                sql.when(&.{sql.filter("uuid", .@"=", null)});
+                break :blk sql.statement();
+            },
+            .update_access => blk: {
+                var sql = Qb.Record.update(
+                    schema.ModelAccess, schema.Filter, c_name, .Exact
+                );
+
+                sql.when(&.{sql.filter("uuid", .@"=", null)});
+                break :blk sql.statement();
+            }
+        };
+
+        const gop = try self.caches.getOrPut(c_name);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+
+        const slot = &@field(gop.value_ptr.*, @tagName(kind));
+        if (slot.*) |*prepared| return prepared;
+
+        slot.* = try self.db.prepare(sql);
+        return &slot.*.?;
+    }
+};
 
 /// # Initializes Sloop with Default Configuration
 /// - `path` - Bucket storage file path (e.g., `bucket.db`), or **null** for
 ///   an in-memory storage
-/// - `mode` - Underlying storage engine threading mode. Use `.SingleThreaded`
-///   when instances are confined to a single thread (skips per-call mutexes)
-/// - `cache` - Underlying storage engine cache size in MB
+/// - `cache` - Underlying storage engine cache size in MB, **per connection**
+/// - `workers` - Connection pool size; **null** means one connection per
+///   available CPU core, otherwise the given count. Match the executor
+///   worker count so every concurrent request gets its own connection
+///   without waiting
 ///
 /// **Remarks:** Run `checkIntegrity()` separately (e.g., on first open or
-/// periodically) as it is an O(database size) operation.
+/// periodically) as it is an O(database size) operation. In-memory storage
+/// (`path = null`) cannot be shared between connections, so the pool
+/// collapses to a single connection
 pub fn init(
     io: Io,
     heap: Allocator,
     path: ?StrZ,
-    mode: DbOption,
-    comptime cache: u16
+    comptime cache: u16,
+    workers: ?u16
 ) !Self {
-    try Quill.init(mode);
+    // - The storage engine mode is fixed at `.Serialized` and configured once
+    //   per process: the pool hands each connection to whichever worker is
+    //   free, so a cursor or stream may complete its lifecycle on a different
+    //   worker thread than it started on — serialized mode is the only
+    //   configuration that makes such sequential cross-thread use safe
+    // - NOTE: this is a process-global configuration, not a per-instance one
+    try Quill.init(.Serialized);
+    errdefer Quill.deinit();
 
-    var db = try Quill.open(heap, path, .All);
+    const cpu_threads: u16 = @intCast(try std.Thread.getCpuCount());
+    const threads = workers orelse cpu_threads;
+    if (threads == 0) @panic("Need at Least One or More Connections!");
 
-    try Builtins.Pragma.optimize(&db);
-    try Builtins.Pragma.setJournal(&db, .WAL);
-    try Builtins.Pragma.setSynchronous(&db, .NORMAL);
-    try Builtins.Pragma.setCache(&db, -(@as(i32, cache) * 1024));
+    // In-memory storage cannot be shared between connections — the pool
+    // collapses to a single connection so every thread sees the same tables
+    const count: usize = if (path == null) 1 else threads;
 
-    return .{
-        .io = io,
-        .heap = heap,
-        .storage = db,
-        .caches = std.StringHashMap(StmtCache).init(heap)
+    const shared = try heap.create(Shared);
+    errdefer heap.destroy(shared);
+
+    const pool = try heap.alloc(Conn, count);
+    errdefer heap.free(pool);
+
+    var opened: usize = 0;
+    errdefer for (pool[0..opened]) |*conn| {
+        conn.caches.deinit();
+        conn.db.close();
     };
+
+    for (pool, 0..) |*conn, idx| {
+        conn.* = .{
+            .db = undefined,
+            .heap = heap,
+            .shared = shared,
+            .io = io,
+            .idx = idx,
+            .caches = std.StringHashMap(StmtCache).init(heap)
+        };
+
+        conn.db = try Quill.open(heap, path, .All);
+        opened += 1;
+
+        try Builtins.Pragma.optimize(&conn.db);
+        try Builtins.Pragma.setJournal(&conn.db, .WAL);
+        try Builtins.Pragma.setSynchronous(&conn.db, .NORMAL);
+        try Builtins.Pragma.setCache(&conn.db, -(@as(i32, cache) * 1024));
+
+        // Cross-connection writers collide in WAL mode; retry instead of
+        // failing the request
+        var timeout = try conn.db.exec("PRAGMA busy_timeout = 5000;");
+        defer timeout.destroy();
+    }
+
+    const free_list = try heap.alloc(usize, count);
+    errdefer heap.free(free_list);
+
+    for (0..count) |idx| free_list[idx] = count - 1 - idx; // LIFO reuse
+
+    shared.* = .{
+        .pool = pool, .free_list = free_list, .top = count
+    };
+
+    return .{.io = io, .heap = heap, .shared = shared};
 }
 
 /// # Checks Internal Consistency of the Storage
 /// **Remarks:** Cost is O(database size), avoid on every open. Returns
 /// `FailedIntegrityChecks` when the database file is corrupted
 pub fn checkIntegrity(self: *Self) !void {
-    try Builtins.Pragma.checkIntegrity(&self.storage);
+    const conn = try self.acquire();
+    defer conn.release();
+
+    try Builtins.Pragma.checkIntegrity(&conn.db);
+}
+
+/// # Takes an Exclusive Storage Connection Out of the Pool
+/// **Remarks:** The connection must be returned via `release()` before the
+/// operation ends — long-lived handles (cursors, streams) hold the checkout
+/// until they are closed. Returns `PoolClosed` after `shutdown()`
+fn acquire(self: *Self) Error!*Conn {
+    return self.shared.acquire(self.io);
+}
+
+/// # Stops the Connection Pool (Shutdown Aid)
+/// **Remarks:** Wakes every worker parked in `acquire()` with `PoolClosed`,
+/// letting their tasks unwind so the executor workers can reach the exit
+/// handshake. In-flight operations finish normally on their own connection.
+/// Call once the shutdown signal has landed; `deinit()` calls it too, but
+/// by then the executor must already be quiesced
+pub fn shutdown(self: *Self) void {
+    self.shared.close(self.io);
 }
 
 /// # Destroys the Sloop Instance
+/// **Remarks:** Every connection must be back in the pool when this runs —
+/// closing a connection that an in-flight operation still holds is a
+/// use-after-free
 pub fn deinit(self: *Self) void {
-    var it = self.caches.iterator();
-    while (it.next()) |entry| {
-        inline for (@typeInfo(StmtCache).@"struct".field_names) |f_name| {
-            if (@field(entry.value_ptr.*, f_name)) |*prepared| {
-                prepared.destroy();
+    self.shutdown();
+
+    const shared = self.shared;
+
+    for (shared.pool) |*conn| {
+        var it = conn.caches.iterator();
+        while (it.next()) |entry| {
+            inline for (@typeInfo(StmtCache).@"struct".field_names) |f_name| {
+                if (@field(entry.value_ptr.*, f_name)) |*prepared| {
+                    prepared.destroy();
+                }
             }
         }
+
+        conn.caches.deinit();
+        conn.db.close();
     }
 
-    self.caches.deinit();
-    self.storage.close();
+    self.heap.free(shared.free_list);
+    self.heap.free(shared.pool);
+    self.heap.destroy(shared);
     Quill.deinit();
 }
 
-/// # Returns the Prepared Statement Interface for the Given Operation
-/// **Remarks:** Statements are compiled once per container and kept alive for
-/// reuse — quill's `CRUD` recycles the statement automatically on every
-/// operation, removing the per-call recompilation cost. Intended for internal
-/// use only: returned statements must never be `destroy()`ed by callers and
-/// must not span across operations (each operation completes its own stepping).
-fn stmt(self: *Self, comptime kind: Stmt, comptime c_name: Str) !*Quill.CRUD {
-    const sql = comptime switch (kind) {
-        .find_info => blk: {
-            var sql = Qb.Record.find(schema.ViewInfo, schema.Filter, c_name);
-            sql.when(&.{sql.filter("uuid", .@"=", null)});
-            break :blk sql.statement();
-        },
-        .find_data => blk: {
-            var sql = Qb.Record.find(schema.ViewData, schema.Filter, c_name);
-            sql.when(&.{sql.filter("uuid", .@"=", null)});
-            break :blk sql.statement();
-        },
-        .insert => blk: {
-            var sql = Qb.Record.create(schema.Model, c_name, .Default);
-            break :blk sql.statement();
-        },
-        .remove => blk: {
-            var sql = Qb.Record.remove(schema.Filter, c_name, .Exact);
-            sql.when(&.{sql.filter("uuid", .@"=", null)});
-            break :blk sql.statement();
-        },
-        .update_owner => blk: {
-            var sql = Qb.Record.update(
-                schema.ModelOwner, schema.Filter, c_name, .Exact
-            );
-
-            sql.when(&.{sql.filter("uuid", .@"=", null)});
-            break :blk sql.statement();
-        },
-        .update_access => blk: {
-            var sql = Qb.Record.update(
-                schema.ModelAccess, schema.Filter, c_name, .Exact
-            );
-
-            sql.when(&.{sql.filter("uuid", .@"=", null)});
-            break :blk sql.statement();
-        }
-    };
-
-    const gop = try self.caches.getOrPut(c_name);
-    if (!gop.found_existing) gop.value_ptr.* = .{};
-
-    const slot = &@field(gop.value_ptr.*, @tagName(kind));
-    if (slot.*) |*prepared| return prepared;
-
-    slot.* = try self.storage.prepare(sql);
-    return &slot.*.?;
-}
-
 /// # Creates Indexes on Object Containers
+/// **Remarks:** SQLite index names are database-global, so each container
+/// gets its own uniquely named index — a shared name would make
+/// `IF NOT EXISTS` silently skip every container after the first
 pub fn setIndex(self: *Self) !void {
+    const conn = try self.acquire();
+    defer conn.release();
+
     var containers = self.bucket();
-    const items = try containers.list();
+    const items = try containers.listWith(conn);
     defer containers.freeList(items);
 
     for (items) |item| {
-        const fmt_str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_uuid ON {s}(\"uuid\");";
-        const sql = try fmt.allocPrintSentinel(self.heap, fmt_str, .{item}, 0);
+        const fmt_str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_uuid_{s} ON {s}(\"uuid\");";
+        const sql = try fmt.allocPrintSentinel(self.heap, fmt_str, .{ item, item }, 0);
         defer self.heap.free(sql);
 
-        var result = try self.storage.exec(sql);
+        var result = try conn.db.exec(sql);
         defer result.destroy();
 
         std.debug.assert(result.count() == 0);
@@ -191,19 +362,36 @@ const Bucket = struct {
     /// - `name` - Name of the object container (e.g., `user_img`)
     pub fn create(self: *Bucket, comptime name: Str) !void {
         const sql = comptime Qb.Container.create(schema.Model, name, .RowId);
-        var result = try self.parent.storage.exec(sql);
+
+        const conn = try self.parent.acquire();
+        defer conn.release();
+
+        var result = try conn.db.exec(sql);
         result.destroy();
     }
 
     /// # Removes the Object Container
     /// - `name` - Name of the object container (e.g., `user_img`)
     pub fn remove(self: *Bucket, comptime name: Str) !void {
-        try Builtins.Container.delete(&self.parent.storage, name, .Retain);
+        const conn = try self.parent.acquire();
+        defer conn.release();
+
+        try Builtins.Container.delete(&conn.db, name, .Retain);
     }
 
     /// # Retrieves Object Container Names
     /// **WARNING:** Return value must be freed by calling `freeList()`.
     pub fn list(self: *Bucket) ![]const Str {
+        const conn = try self.parent.acquire();
+        defer conn.release();
+
+        return self.listWith(conn);
+    }
+
+    /// # Retrieves Object Container Names on an Already Checked Out
+    /// Connection
+    /// **Remarks:** Intended for internal use only
+    fn listWith(self: *Bucket, conn: *Conn) ![]const Str {
         const heap = self.parent.heap;
 
         var tables: ArrayList(Str) = .empty;
@@ -211,7 +399,7 @@ const Bucket = struct {
 
         const sql = "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%';";
 
-        var result = try self.parent.storage.exec(sql);
+        var result = try conn.db.exec(sql);
         defer result.destroy();
 
         try tables.ensureTotalCapacity(heap, result.count());
@@ -251,14 +439,18 @@ const Bucket = struct {
     /// **WARNING:** Each row must be freed via `Row.free()`, and the cursor
     /// closed via `Cursor.close()` — including on early loop exits.
     pub fn scan(self: *Bucket, comptime name: Str) !Cursor {
+        const conn = try self.parent.acquire();
+        errdefer conn.release();
+
         const sql = comptime blk: {
             var sql = Qb.Record.find(schema.ViewScan, schema.Filter, name);
             break :blk sql.statement();
         };
 
-        var crud = try self.parent.storage.prepare(sql);
+        var crud = try conn.db.prepare(sql);
         errdefer crud.destroy();
 
+        // The connection stays checked out until the cursor is closed
         return .{.crud = crud};
     }
 
@@ -300,9 +492,11 @@ const Bucket = struct {
             return if (rec) |r| .{.rec = r, .crud = self.crud} else null;
         }
 
-        /// # Closes the Cursor
+        /// # Closes the Cursor and Returns its Connection to the Pool
         pub fn close(self: *Cursor) void {
+            const conn: *Conn = @fieldParentPtr("db", self.crud.db);
             self.crud.destroy();
+            conn.release();
         }
     };
 };
@@ -339,7 +533,10 @@ pub const Object = struct {
             .cat = DateTime.timestamp(self.parent.io)
         };
 
-        const crud = try self.parent.stmt(.insert, c_name);
+        const conn = try self.parent.acquire();
+        defer conn.release();
+
+        const crud = try conn.stmt(.insert, c_name);
         crud.exec(rec, null, null) catch |err| {
             crud.reset() catch {};
             return err;
@@ -359,7 +556,10 @@ pub const Object = struct {
         uuid: Str,
         access: ?Str
     ) !Str {
-        const crud = try self.parent.stmt(.find_data, c_name);
+        const conn = try self.parent.acquire();
+        defer conn.release();
+
+        const crud = try conn.stmt(.find_data, c_name);
 
         const filter = schema.Filter {.uuid = uuid};
         var result = crud.readOne(schema.ViewData, filter) catch |err| {
@@ -398,7 +598,10 @@ pub const Object = struct {
     ) !void {
         const heap = self.parent.heap;
 
-        var session = try self.authorize(c_name, uuid, owner, true);
+        const conn = try self.parent.acquire();
+        defer conn.release();
+
+        var session = try authorize(conn, c_name, uuid, owner, true);
         defer session.free();
 
         var list: ArrayList(Str) = .empty;
@@ -428,7 +631,7 @@ pub const Object = struct {
 
         const filter = schema.Filter {.uuid = uuid};
 
-        const crud = try self.parent.stmt(
+        const crud = try conn.stmt(
             if (comptime mem.eql(u8, field, "owner"))
                 Stmt.update_owner
             else
@@ -523,10 +726,13 @@ pub const Object = struct {
         uuid: Str,
         access: ?Str
     ) !void {
-        var session = try self.authorize(c_name, uuid, access, true);
+        const conn = try self.parent.acquire();
+        defer conn.release();
+
+        var session = try authorize(conn, c_name, uuid, access, true);
         defer session.free();
 
-        const crud = try self.parent.stmt(.remove, c_name);
+        const crud = try conn.stmt(.remove, c_name);
         const filter = schema.Filter {.uuid = uuid};
 
         crud.remove(filter, null) catch |err| {
@@ -549,11 +755,14 @@ pub const Object = struct {
                 return self.rec;
             }
 
-            /// # Releases the Record Memory and Recycles the Statement
+            /// # Releases the Record Memory
+            /// **Remarks:** The statement was already recycled by `fetch()`
+            /// before this handle was returned, so `free()` only releases the
+            /// heap-owned record memory — it never touches the shared
+            /// statement of a pooled connection
             /// **WARNING:** Must be called exactly once
             pub fn free(self: *@This()) void {
                 self.crud.free(self.rec);
-                self.crud.reset() catch {};
             }
         };
     }
@@ -574,19 +783,22 @@ pub const Object = struct {
         uuid: Str,
         access: ?Str
     ) !Info {
-        return self.authorize(c_name, uuid, access, true);
+        const conn = try self.parent.acquire();
+        defer conn.release();
+
+        return authorize(conn, c_name, uuid, access, true);
     }
 
     /// # Fetches the ACL-Validated Object Record (Single Query)
     /// **Remarks:** Intended for internal use only
     fn authorize(
-        self: *Object,
+        conn: *Conn,
         comptime c_name: Str,
         uuid: Str,
         access: ?Str,
         owner_only: bool
     ) !Info {
-        var session = try self.fetch(c_name, uuid);
+        var session = try fetch(conn, c_name, uuid);
         errdefer session.free();
 
         if (clearance(session.rec, access, owner_only) == .none) {
@@ -597,11 +809,16 @@ pub const Object = struct {
     }
 
     /// # Fetches the ACL-Validated Object Record (Single Query)
-    /// **Remarks:** Intended for internal use only. The shared statement is
-    /// recycled right after the fetch — holding the returned session must not
-    /// keep the underlying statement busy for other operations
-    fn fetch(self: *Object, comptime c_name: Str, uuid: Str) !Fetch(schema.ViewInfo) {
-        const crud = try self.parent.stmt(.find_info, c_name);
+    /// **Remarks:** Intended for internal use only. The statement is
+    /// recycled right after the fetch — the returned session only carries
+    /// heap-owned record memory, so holding it never keeps the underlying
+    /// statement busy for other operations
+    fn fetch(
+        conn: *Conn,
+        comptime c_name: Str,
+        uuid: Str
+    ) !Fetch(schema.ViewInfo) {
+        const crud = try conn.stmt(.find_info, c_name);
 
         const filter = schema.Filter {.uuid = uuid};
         const result = crud.readOne(schema.ViewInfo, filter) catch |err| {
@@ -671,7 +888,10 @@ pub const Object = struct {
             .cat = DateTime.timestamp(self.parent.io)
         };
 
-        const crud = try self.parent.stmt(.insert, c_name);
+        const conn = try self.parent.acquire();
+        defer conn.release();
+
+        const crud = try conn.stmt(.insert, c_name);
         crud.exec(rec, null, null) catch |err| {
             crud.reset() catch {};
             return err;
@@ -699,7 +919,10 @@ pub const Object = struct {
         uuid: Str,
         access: ?Str
     ) !BlobStream {
-        var session = try self.fetch(c_name, uuid);
+        const conn = try self.parent.acquire();
+        errdefer conn.release();
+
+        var session = try fetch(conn, c_name, uuid);
         defer session.free();
 
         const level = clearance(session.rec, access, false);
@@ -708,14 +931,19 @@ pub const Object = struct {
         // Rejects stale rowids (e.g., after a concurrent remove and re-insert)
         if (session.rec.rowid != rid) return Error.NotFound;
 
+        // The connection stays checked out until `closeStream()` is called
         return BlobStream.open(
-            &self.parent.storage, c_name, "data", rid,
+            &conn.db, c_name, "data", rid,
             if (level == .write) .ReadWrite else .Read
         );
     }
 
-    /// # Closes Object Streaming
-    pub fn closeStream(blob: *BlobStream) void { blob.close(); }
+    /// # Closes Object Streaming and Returns the Connection to the Pool
+    pub fn closeStream(blob: *BlobStream) void {
+        const conn: *Conn = @fieldParentPtr("db", blob.db);
+        blob.close();
+        conn.release();
+    }
 
     /// # Writes Incremental Data to the Object
     /// - `part` - Data fragment for incremental write
@@ -767,7 +995,7 @@ pub const StreamObject = struct {
 const testing = std.testing;
 
 fn testSloop() !Self {
-    return try init(testing.io, testing.allocator, null, .SingleThreaded, 8);
+    return try init(testing.io, testing.allocator, null, 8, null);
 }
 
 test "bucket lifecycle" {
@@ -789,12 +1017,105 @@ test "bucket lifecycle" {
 
     try s.setIndex(); // Indexes every existing container
 
+    // Each container must own its uniquely named index — SQLite index names
+    // are database-global, so a shared name would skip every container
+    // after the first
+    {
+        const conn = try s.acquire();
+        defer conn.release();
+
+        var result = try conn.db.exec(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_uuid_%' ORDER BY name;"
+        );
+        defer result.destroy();
+
+        try testing.expectEqual(@as(usize, 2), result.count());
+        try testing.expectEqualStrings("idx_uuid_bucket_a", result.next().?[0].data);
+        try testing.expectEqualStrings("idx_uuid_bucket_b", result.next().?[0].data);
+    }
+
     try containers.remove("bucket_b");
 
     const remaining = try containers.list();
     defer containers.freeList(remaining);
     try testing.expectEqual(@as(usize, 1), remaining.len);
     try testing.expectEqualStrings("bucket_a", remaining[0]);
+}
+
+test "pooled connections serve concurrent operations" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const heap = testing.allocator;
+
+    // File-backed storage so the pool keeps multiple connections — in-memory
+    // storage collapses to a single connection and cannot exercise this.
+    // `testing.tmpDir()` creates its directory under `.zig-cache/tmp/<sub_path>`
+    const dir_path = try std.fmt.allocPrintSentinel(
+        heap, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0
+    );
+    defer heap.free(dir_path);
+
+    // File-backed storage so the pool keeps multiple connections — in-memory
+    // storage collapses to a single connection and cannot exercise this
+    const path = try std.fmt.allocPrintSentinel(heap, "{s}/pool.db", .{dir_path}, 0);
+    defer heap.free(path);
+
+    var s = try init(testing.io, heap, path, 4, 4);
+    defer s.deinit();
+
+    var containers = s.bucket();
+    try containers.create("parallel");
+
+    var failures = std.atomic.Value(u32).init(0);
+
+    const Runner = struct {
+        parent: *Self,
+        id: usize,
+        fail: *std.atomic.Value(u32),
+
+        fn run(self: @This()) void {
+            self.work() catch {
+                _ = self.fail.fetchAdd(1, .release);
+            };
+        }
+
+        fn work(self: @This()) !void {
+            var obj = self.parent.object();
+
+            var i: usize = 0;
+            while (i < 16) : (i += 1) {
+                var name_buf: [24]u8 = undefined;
+                const name = try std.fmt.bufPrint(
+                    &name_buf, "w{d}_{d}.txt", .{self.id, i}
+                );
+
+                const payload = try std.fmt.allocPrint(
+                    heap, "payload-{d}-{d}", .{self.id, i}
+                );
+                defer heap.free(payload);
+
+                const uuid = try obj.put("parallel", name, payload, &.{}, &.{});
+
+                const blob = try obj.get("parallel", &uuid, null);
+                defer heap.free(blob);
+                try testing.expectEqualStrings(payload, blob);
+
+                try obj.remove("parallel", &uuid, null);
+            }
+        }
+    };
+
+    var threads: [4]std.Thread = undefined;
+    for (&threads, 0..) |*thread, idx| {
+        thread.* = try std.Thread.spawn(.{}, Runner.run, .{
+            Runner {.parent = &s, .id = idx, .fail = &failures}
+        });
+    }
+
+    for (&threads) |*thread| thread.join();
+
+    try testing.expectEqual(@as(u32, 0), failures.load(.acquire));
 }
 
 test "object put, get and remove with ACL" {
@@ -973,40 +1294,45 @@ test "provision and stream I/O bounds" {
     // Stale or foreign rowid is rejected
     try testing.expectError(Error.NotFound, obj.openStream("media", rid + 1, &uuid, "alice"));
 
-    // Owners stream read-write
-    var writer = try obj.openStream("media", rid, &uuid, "alice");
-    defer Object.closeStream(&writer);
+    // Owners stream read-write — the stream holds the pool's only
+    // connection (in-memory), so it is closed before any other operation
+    {
+        var writer = try obj.openStream("media", rid, &uuid, "alice");
+        defer Object.closeStream(&writer);
 
-    try Object.incWrite(&writer, "hello", 0);
-    try Object.incWrite(&writer, "world", 5);
+        try Object.incWrite(&writer, "hello", 0);
+        try Object.incWrite(&writer, "world", 5);
 
-    // Bounds: fragment bigger than the object
-    const big: [17]u8 = @splat('A');
-    try testing.expectError(error.FragmentTooBig, Object.incWrite(&writer, &big, 0));
+        // Bounds: fragment bigger than the object
+        const big: [17]u8 = @splat('A');
+        try testing.expectError(error.FragmentTooBig, Object.incWrite(&writer, &big, 0));
 
-    // Bounds: offset beyond the writable range (underflow regression)
-    try testing.expectError(error.InvalidOffset, Object.incWrite(&writer, "AB", 20));
-    try testing.expectError(error.InvalidOffset, Object.incWrite(&writer, "AB", 15));
+        // Bounds: offset beyond the writable range (underflow regression)
+        try testing.expectError(error.InvalidOffset, Object.incWrite(&writer, "AB", 20));
+        try testing.expectError(error.InvalidOffset, Object.incWrite(&writer, "AB", 15));
 
-    // Empty fragment is a no-op, even at the end of the object
-    try Object.incWrite(&writer, "", 16);
+        // Empty fragment is a no-op, even at the end of the object
+        try Object.incWrite(&writer, "", 16);
+    }
 
     // Access-listed entities stream read-only
-    var viewer = try obj.openStream("media", rid, &uuid, "bob");
-    defer Object.closeStream(&viewer);
+    {
+        var viewer = try obj.openStream("media", rid, &uuid, "bob");
+        defer Object.closeStream(&viewer);
 
-    try testing.expectError(error.UnknownError, Object.incWrite(&viewer, "XX", 0));
+        try testing.expectError(error.Locked, Object.incWrite(&viewer, "XX", 0));
 
-    var buffer: [4]u8 = undefined;
-    try testing.expectEqualStrings("hell", (try Object.incRead(&viewer, &buffer)).?);
-    try testing.expectEqualStrings("o wo", (try Object.incRead(&viewer, &buffer)).?);
-    try testing.expectEqualStrings("rld", (try Object.incRead(&viewer, &buffer)).?);
-    try testing.expectEqualStrings("\x00\x00\x00\x00", (try Object.incRead(&viewer, &buffer)).?);
-    try testing.expect((try Object.incRead(&viewer, &buffer)) == null);
+        var buffer: [4]u8 = undefined;
+        try testing.expectEqualStrings("hell", (try Object.incRead(&viewer, &buffer)).?);
+        try testing.expectEqualStrings("owor", (try Object.incRead(&viewer, &buffer)).?);
+        try testing.expectEqualStrings("ld\x00\x00", (try Object.incRead(&viewer, &buffer)).?);
+        try testing.expectEqualStrings("\x00\x00\x00\x00", (try Object.incRead(&viewer, &buffer)).?);
+        try testing.expect((try Object.incRead(&viewer, &buffer)) == null);
 
-    // Read buffer bigger than the object is rejected
-    const big_read: [17]u8 = @splat('A');
-    try testing.expectError(error.FragmentTooBig, Object.incRead(&viewer, &big_read));
+        // Read buffer bigger than the object is rejected
+        var big_read: [17]u8 = @splat('A');
+        try testing.expectError(error.FragmentTooBig, Object.incRead(&viewer, &big_read));
+    }
 }
 
 test "stream write requires ownership" {
@@ -1024,11 +1350,15 @@ test "stream write requires ownership" {
 
     const rid = info.value().rowid;
 
-    // Access-listed entity gets a read-only stream
-    var viewer = try obj.openStream("media", rid, &uuid, "bob");
-    defer Object.closeStream(&viewer);
+    // Access-listed entity gets a read-only stream — the stream holds the
+    // pool's only connection (in-memory), so it is closed before the next
+    // provision
+    {
+        var viewer = try obj.openStream("media", rid, &uuid, "bob");
+        defer Object.closeStream(&viewer);
 
-    try testing.expectError(error.UnknownError, Object.incWrite(&viewer, "XX", 0));
+        try testing.expectError(error.Locked, Object.incWrite(&viewer, "XX", 0));
+    }
 
     // Public objects stream read-only for everyone
     const pub_uuid = try obj.provision("media", "open.bin", 16, &.{}, &.{});
@@ -1036,10 +1366,12 @@ test "stream write requires ownership" {
     var pub_info = try obj.info("media", &pub_uuid, null);
     defer pub_info.free();
 
-    var public = try obj.openStream("media", pub_info.value().rowid, &pub_uuid, null);
-    defer Object.closeStream(&public);
+    {
+        var public = try obj.openStream("media", pub_info.value().rowid, &pub_uuid, null);
+        defer Object.closeStream(&public);
 
-    try testing.expectError(error.UnknownError, Object.incWrite(&public, "XX", 0));
+        try testing.expectError(error.Locked, Object.incWrite(&public, "XX", 0));
+    }
 
     const data = try obj.get("media", &pub_uuid, null);
     defer testing.allocator.free(data);
@@ -1058,24 +1390,30 @@ test "scan iterates container records progressively" {
     _ = try obj.put("docs", "b.txt", "two", &.{}, &.{});
     _ = try obj.provision("docs", "c.bin", 64, &.{}, &.{});
 
-    var cursor = try containers.scan("docs");
-    defer cursor.close();
-
     var names: [3][]const u8 = undefined;
-    var count: usize = 0;
 
-    while (try cursor.next()) |row| {
-        defer row.free();
+    // The cursor holds the pool's only connection (in-memory), so it is
+    // closed before any other operation needs a connection
+    {
+        var cursor = try containers.scan("docs");
+        defer cursor.close();
 
-        try testing.expect(count < names.len);
-        names[count] = try testing.allocator.dupe(u8, row.value().name);
-        try testing.expect(row.value().uuid.len == 36);
-        try testing.expect(row.value().size > 0);
-        try testing.expect(row.value().rowid > 0);
-        count += 1;
+        var count: usize = 0;
+
+        while (try cursor.next()) |row| {
+            defer row.free();
+
+            try testing.expect(count < names.len);
+            names[count] = try testing.allocator.dupe(u8, row.value().name);
+            try testing.expect(row.value().uuid.len == 36);
+            try testing.expect(row.value().size > 0);
+            try testing.expect(row.value().rowid > 0);
+            count += 1;
+        }
+
+        try testing.expectEqual(@as(usize, 3), count);
     }
 
-    try testing.expectEqual(@as(usize, 3), count);
     try testing.expectEqualStrings("a.txt", names[0]);
     try testing.expectEqualStrings("b.txt", names[1]);
     try testing.expectEqualStrings("c.bin", names[2]);
@@ -1083,10 +1421,12 @@ test "scan iterates container records progressively" {
     for (names) |item| testing.allocator.free(item);
 
     // Early loop exit with an explicit close (no leaked rows or cursor)
-    var partial = try containers.scan("docs");
-    const first = (try partial.next()).?;
-    first.free();
-    partial.close();
+    {
+        var partial = try containers.scan("docs");
+        const first = (try partial.next()).?;
+        first.free();
+        partial.close();
+    }
 
     // Empty containers yield no rows
     try containers.create("empty_docs");

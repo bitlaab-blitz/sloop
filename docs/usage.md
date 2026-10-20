@@ -15,17 +15,20 @@ var gpa_mem = std.heap.DebugAllocator(.{}).init;
 defer std.debug.assert(gpa_mem.deinit() == .ok);
 const heap = gpa_mem.allocator();
 
-// Single-threaded process — `.SingleThreaded` skips per-call SQLite mutexes.
-// Use `.Serialized` (or `.MultiThreaded`) when sharing instances across threads.
-var sloop = try Sloop.init(init.io, heap, "bucket.db", .SingleThreaded, 32);
+// Opens a pool of storage connections — `workers = null` means one connection
+// per available CPU core (pass an explicit count to match your executor's
+// worker count so every concurrent request gets its own connection without
+// waiting). `cache` is the per-connection storage engine cache size in MB
+var sloop = try Sloop.init(init.io, heap, "bucket.db", 32, null);
 try sloop.setIndex();
 defer sloop.deinit();
 ```
 
-Passing `null` instead of a path creates an in-memory storage:
+Passing `null` instead of a path creates an in-memory storage. It cannot be
+shared between connections, so the pool collapses to a single connection:
 
 ```zig
-var sloop = try Sloop.init(init.io, heap, null, .SingleThreaded, 32);
+var sloop = try Sloop.init(init.io, heap, null, 32, null);
 ```
 
 A full consistency check of the storage file can be run at any time. It is an
@@ -34,6 +37,32 @@ O(database size) operation — typically run once on startup or periodically:
 ```zig
 try sloop.checkIntegrity();
 ```
+
+## Concurrency & Shutdown
+
+Operations run on pooled connections — long-lived handles (scan cursors and
+open streams) hold their connection until they are closed, so keep the number
+of simultaneously open cursors and streams below the pool size.
+
+Before tearing the executor down, stop the pool so every worker parked on an
+acquisition wakes and unwinds instead of waiting forever:
+
+```zig
+sloop.shutdown(); // every future acquisition fails with `error.PoolClosed`
+```
+
+Connections already checked out keep working until they are released.
+`deinit()` stops the pool too, but by then every in-flight operation must
+already be finished — closing a connection an operation still holds is a
+use-after-free.
+
+**NOTE:**
+
+- Close open streams (and scan cursors) before mutating the same record —
+  `remove()`, `addOwner()`, `removeOwner()` etc. on a record with an open
+  stream fail with `error.ConnectionIsBusy`
+- A connection must never be acquired twice within one operation — nesting
+  deadlocks the pool once every connection is checked out
 
 ## Bucket Operations
 

@@ -22,6 +22,43 @@ Here we write upgrading notes and make them as straightforward as possible.
 - A short description for fixed item 2
 - A short description for fixed item n
 
+## [v1.4.0] - 2026-10-20
+
+Connection pooling release — concurrent request handling with per-connection
+statement caches and a graceful shutdown path.
+
+### Added
+- Internal connection pool — `Sloop.init()` now opens one storage connection
+  per worker; each operation checks out an exclusive connection and returns
+  it to the pool on completion (LIFO reuse, parked acquirers wake on release)
+- `Sloop.shutdown()` — stops the pool, waking every parked acquirer with
+  `error.PoolClosed` so in-flight tasks can unwind during shutdown;
+  connections already checked out keep working until released
+- `error.PoolClosed` — returned by any operation that needs a connection
+  after `shutdown()`
+- In-memory storage (`null` path) collapses the pool to a single connection,
+  since an in-memory database cannot be shared between connections
+- Unit tests covering pooled concurrent `put`/`get`/`remove`, ACL edges,
+  stream I/O bounds and progressive scan iteration
+
+### Changed
+- **BREAKING:** `Sloop.init()` no longer takes the storage engine threading
+  mode — it is fixed to `.Serialized` internally, the only configuration safe
+  for a cursor or stream that completes its lifecycle on a different worker
+  thread than it started on. The signature is now
+  `init(io, heap, path, cache, workers)` where `workers = null` opens one
+  connection per available CPU core
+- `cache` is now applied **per connection** instead of a single shared
+  connection
+- Every pooled connection sets `PRAGMA busy_timeout = 5000` so
+  cross-connection writers in WAL mode retry instead of failing the request
+- Prepared statements are compiled once per connection **and** container and
+  reused across operations
+
+### Notes
+- Scan cursors and open streams hold their pooled connection until closed;
+  mutating the same record while its stream is open fails with
+  `error.ConnectionIsBusy` — close the stream first (see `docs/usage.md`)
 
 ## [v1.3.0] - 2026-10-10
 
