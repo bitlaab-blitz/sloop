@@ -372,21 +372,21 @@ pub fn deinit(self: *Self) void {
 /// gets its own uniquely named index — a shared name would make
 /// `IF NOT EXISTS` silently skip every container after the first
 /// # Doubles Double-Quotes of a SQL Identifier for Quoting
-/// **Remarks:** Container names are normally comptime literals, but indexes
-/// are built from names read out of `sqlite_master` — quoting plus escaping
-/// keeps any foreign table name from breaking out of the statement
+/// **Remarks:** Returns the escaped text **without** surrounding quotes —
+/// call sites embed it inside their own quote pairs. Container names are
+/// normally comptime literals, but indexes are built from names read out of
+/// `sqlite_master` — quoting plus escaping keeps any foreign table name from
+/// breaking out of the statement
 fn escapeSqlIdent(self: *Self, name: Str) ![]u8 {
     var out: ArrayList(u8) = .empty;
     errdefer out.deinit(self.heap);
 
-    try out.ensureTotalCapacity(self.heap, (name.len * 2) + 2);
+    try out.ensureTotalCapacity(self.heap, name.len * 2);
 
-    out.appendAssumeCapacity('"');
     for (name) |c| {
         out.appendAssumeCapacity(c);
         if (c == '"') out.appendAssumeCapacity('"');
     }
-    out.appendAssumeCapacity('"');
 
     return out.toOwnedSlice(self.heap);
 }
@@ -404,7 +404,7 @@ pub fn setIndex(self: *Self) !void {
         defer self.heap.free(ident);
 
         const fmt_str =
-            "CREATE UNIQUE INDEX IF NOT EXISTS \"idx_uuid_{s}\" ON {s}(\"uuid\");";
+            "CREATE UNIQUE INDEX IF NOT EXISTS \"idx_uuid_{s}\" ON \"{s}\"(\"uuid\");";
 
         const sql = try fmt.allocPrintSentinel(self.heap, fmt_str, .{ ident, ident }, 0);
         defer self.heap.free(sql);
