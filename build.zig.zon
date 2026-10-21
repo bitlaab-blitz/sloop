@@ -1,6 +1,6 @@
 .{
     .name = .sloop,
-    .version = "1.4.0",
+    .version = "1.5.0",
     .fingerprint = 0xf84baff04b4bbbd1,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{

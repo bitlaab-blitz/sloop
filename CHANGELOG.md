@@ -22,6 +22,39 @@ Here we write upgrading notes and make them as straightforward as possible.
 - A short description for fixed item 2
 - A short description for fixed item n
 
+
+## [v1.5.0] - 2026-10-21
+
+Correctness release — transactional ACL mutations, snapshot-consistent reads
+and a clearance override API.
+
+### Added
+- `Override` clearance parameter on every ACL-checked operation (`get()`,
+  `info()`, `remove()`, `openStream()`, `addOwner()`, `removeOwner()`,
+  `addAccess()`, `removeAccess()`) — `.default` keeps the built-in policy,
+  `.owner` tightens clearance to owners only, `.access` relaxes it to the
+  access list, `.bypass` skips the check entirely
+
+### Changed
+- `get()` checks clearance on the lean info view first and only pulls the
+  blob for cleared reads — denied reads no longer pay the data transfer
+- `incRead()` yields a partial read when the buffer exceeds the remaining
+  data instead of failing with `FragmentTooBig`; `null` still marks the end
+  of the stream
+- Documented the one-instance-per-process contract — the storage engine mode
+  is configured globally on `init()` and torn down by `deinit()`
+
+### Fixed
+- ACL mutations are transactional — concurrent pooled connections can no
+  longer interleave the owner/access snapshot with its rewrite, which
+  silently dropped list entries (lost updates) and could defeat the
+  last-owner guard
+- `remove()` runs its ACL check and delete atomically
+- `get()` reads run in a deferred snapshot transaction, keeping the ACL
+  decision and the blob fetch on one consistent row state
+- `setIndex()` quotes and escapes container names read from `sqlite_master`,
+  so a foreign table name cannot break out of the index statement
+
 ## [v1.4.0] - 2026-10-20
 
 Connection pooling release — concurrent request handling with per-connection

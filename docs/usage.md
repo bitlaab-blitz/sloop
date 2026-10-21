@@ -38,6 +38,9 @@ O(database size) operation — typically run once on startup or periodically:
 try sloop.checkIntegrity();
 ```
 
+**WARNING:** Only one `Sloop` instance may live per process — `init()`
+configures the storage engine mode globally and `deinit()` tears it down.
+
 ## Concurrency & Shutdown
 
 Operations run on pooled connections — long-lived handles (scan cursors and
@@ -102,37 +105,35 @@ std.debug.print("{s}\n", .{uuid2});
 
 
 // Adds an entity to the access list
-try obj.addAccess("test_img2", &uuid, "john", "jake");
-try obj.addAccess("test_img2", &uuid, "john", "soul");
+try obj.addAccess("test_img2", &uuid, "john", "jake", .default);
+try obj.addAccess("test_img2", &uuid, "john", "soul", .default);
 
 // Gets object data from the bucket
-const out = try obj.get("test_img2", &uuid, "jake");
+const out = try obj.get("test_img2", &uuid, "jake", .default);
 defer heap.free(out);
 std.debug.print("{s}\n", .{out});
 
 // Removes an entity from the access list
-try obj.removeAccess("test_img2", &uuid, "john", "soul");
+try obj.removeAccess("test_img2", &uuid, "john", "soul", .default);
 
 // Adds an entity to the owner list
-try obj.addOwner("test_img2", &uuid, "john", "foo");
-try obj.addOwner("test_img2", &uuid, "foo", "bar");
-try obj.addOwner("docs2", &uuid, "foo", "baz");
+try obj.addOwner("test_img2", &uuid, "john", "foo", .default);
+try obj.addOwner("test_img2", &uuid, "foo", "bar", .default);
 
 // Removes an entity from the owner list
-try obj.removeOwner("test_img2", &uuid, "foo", "bar");
-try obj.removeOwner("test_img2", &uuid, "baz", "baz");
+try obj.removeOwner("test_img2", &uuid, "foo", "bar", .default);
 
 
 // Gets object info from the bucket
 
 // Private Object
-var info = try obj.info("test_img2", &uuid, "john");
+var info = try obj.info("test_img2", &uuid, "john", .default);
 defer info.free();
 
 std.debug.print("{s}\n", .{info.value().name});
 
 // Public Object
-var info2 = try obj.info("test_img2", &uuid2, null);
+var info2 = try obj.info("test_img2", &uuid2, null, .default);
 defer info2.free();
 
 std.debug.print("{s}\n", .{info2.value().name});
@@ -141,11 +142,32 @@ std.debug.print("{s}\n", .{info2.value().name});
 // Removes object from the bucket
 
 // Private object
-try obj.remove("test_img2", &uuid, "john");
+try obj.remove("test_img2", &uuid, "john", .default);
 
 // Public object
-try obj.remove("test_img2", &uuid2, null);
+try obj.remove("test_img2", &uuid2, null, .default);
 ```
+
+### Clearance Override
+
+Every ACL-checked operation (`get()`, `info()`, `remove()`, `openStream()`,
+`addOwner()`, `removeOwner()`, `addAccess()`, `removeAccess()`) accepts an
+`Override` that resolves against the operation's built-in policy:
+
+```zig
+// `owner` tightens the built-in policy — even listed access is denied
+if (obj.get("test_img2", &uuid, "jake", .owner)) |_| {
+    std.debug.print("ERROR: access entity cleared!\n", .{});
+} else |err| {
+    std.debug.print("Denied: {s}\n", .{@errorName(err)});
+}
+```
+
+- `.default` — keeps the built-in clearance policy of the operation
+- `.owner` — restricts clearance to owners only (tightens)
+- `.access` — extends clearance to access-list entities (relaxes)
+- `.bypass` — skips the clearance check entirely (**WARNING:** grants full
+  owner-level clearance to any caller — use only for trusted internal paths)
 
 **NOTE:**
 
@@ -173,20 +195,20 @@ const uuid2 = try obj.provision("test_img1", "prov.txt", 1024, &.{}, &.{});
 std.debug.print("{s}\n", .{uuid2});
 
 // Gets object info from the bucket
-var info = try obj.info("test_img1", &uuid, "john");
+var info = try obj.info("test_img1", &uuid, "john", .default);
 defer info.free();
 
 // Incrementally writes into the provisional object — streams open as
 // Read-Write only for owners
 const rid = info.value().rowid;
-var blob_writer = try obj.openStream("test_img1", rid, &uuid, "john");
+var blob_writer = try obj.openStream("test_img1", rid, &uuid, "john", .default);
 defer Sloop.Object.closeStream(&blob_writer);
 
 try Sloop.Object.incWrite(&blob_writer, "hello", 2);
 
 // Incrementally reads out of the provisional object — access entities and
 // public objects open Read-Only streams
-var blob_reader = try obj.openStream("test_img1", rid, &uuid, "jane");
+var blob_reader = try obj.openStream("test_img1", rid, &uuid, "jane", .default);
 defer Sloop.Object.closeStream(&blob_reader);
 
 var buffer: [128]u8 = undefined;
@@ -201,6 +223,8 @@ while(try Sloop.Object.incRead(&blob_reader, &buffer)) |data| {
 - Owner and access control operation works same as non-provisioned object
 - Streams open as **Read-Write** only for owners; access entities and public
   objects get **Read-Only** streams — writes through them fail
+- `incRead()` returns `null` at the end of the stream — a buffer larger than
+  the remaining data yields a partial read instead of an error
 
 ## Scanning Object Containers
 

@@ -108,6 +108,44 @@ const Shared = struct {
     }
 };
 
+/// # Explicit Transaction on a Pooled Connection
+/// **Remarks:** Serializes multi-statement operations (e.g., an ACL read
+/// followed by its update) so concurrent pool connections cannot interleave
+/// them — `BEGIN IMMEDIATE` takes the write lock up front while WAL snapshot
+/// isolation keeps every read of one operation on a single consistent view.
+/// `busy_timeout` applies while acquiring the write lock
+const Txn = struct {
+    db: *Quill,
+
+    /// # Read-Only Snapshot Transaction (Deferred)
+    /// **Remarks:** WAL readers coexist with concurrent writers — use when
+    /// the operation only reads and needs a consistent multi-query view
+    fn read(db: *Quill) !Txn {
+        var result = try db.exec("BEGIN DEFERRED;");
+        result.destroy();
+        return .{.db = db};
+    }
+
+    /// # Write Transaction (Immediate)
+    /// **Remarks:** Takes the write lock up front so the read-modify-write
+    /// sequence cannot be interleaved by another pooled connection
+    fn write(db: *Quill) !Txn {
+        var result = try db.exec("BEGIN IMMEDIATE;");
+        result.destroy();
+        return .{.db = db};
+    }
+
+    fn commit(self: *Txn) !void {
+        var result = try self.db.exec("COMMIT;");
+        result.destroy();
+    }
+
+    fn rollback(self: *Txn) void {
+        var result = self.db.exec("ROLLBACK;") catch return;
+        result.destroy();
+    }
+};
+
 /// # Pooled Storage Connection with its Own Statement Cache
 /// **Remarks:** The connection is exclusively owned between checkout and
 /// release, so its statement cache is used without any synchronization.
@@ -196,6 +234,10 @@ const Conn = struct {
 /// periodically) as it is an O(database size) operation. In-memory storage
 /// (`path = null`) cannot be shared between connections, so the pool
 /// collapses to a single connection
+///
+/// **WARNING:** Only one `Sloop` instance may live per process — `Quill.init`
+/// configures the storage engine mode globally and a second `deinit()` would
+/// tear it down under the remaining instance
 pub fn init(
     io: Io,
     heap: Allocator,
@@ -329,6 +371,26 @@ pub fn deinit(self: *Self) void {
 /// **Remarks:** SQLite index names are database-global, so each container
 /// gets its own uniquely named index — a shared name would make
 /// `IF NOT EXISTS` silently skip every container after the first
+/// # Doubles Double-Quotes of a SQL Identifier for Quoting
+/// **Remarks:** Container names are normally comptime literals, but indexes
+/// are built from names read out of `sqlite_master` — quoting plus escaping
+/// keeps any foreign table name from breaking out of the statement
+fn escapeSqlIdent(self: *Self, name: Str) ![]u8 {
+    var out: ArrayList(u8) = .empty;
+    errdefer out.deinit(self.heap);
+
+    try out.ensureTotalCapacity(self.heap, (name.len * 2) + 2);
+
+    out.appendAssumeCapacity('"');
+    for (name) |c| {
+        out.appendAssumeCapacity(c);
+        if (c == '"') out.appendAssumeCapacity('"');
+    }
+    out.appendAssumeCapacity('"');
+
+    return out.toOwnedSlice(self.heap);
+}
+
 pub fn setIndex(self: *Self) !void {
     const conn = try self.acquire();
     defer conn.release();
@@ -338,8 +400,13 @@ pub fn setIndex(self: *Self) !void {
     defer containers.freeList(items);
 
     for (items) |item| {
-        const fmt_str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_uuid_{s} ON {s}(\"uuid\");";
-        const sql = try fmt.allocPrintSentinel(self.heap, fmt_str, .{ item, item }, 0);
+        const ident = try self.escapeSqlIdent(item);
+        defer self.heap.free(ident);
+
+        const fmt_str =
+            "CREATE UNIQUE INDEX IF NOT EXISTS \"idx_uuid_{s}\" ON {s}(\"uuid\");";
+
+        const sql = try fmt.allocPrintSentinel(self.heap, fmt_str, .{ ident, ident }, 0);
         defer self.heap.free(sql);
 
         var result = try conn.db.exec(sql);
@@ -507,6 +574,30 @@ pub const Object = struct {
     /// # Access Levels Granted by the ACL
     const Access = enum { none, read, write };
 
+    /// # Clearance Scope Override for ACL-Checked Operations
+    /// - `default` - Keeps the built-in clearance policy of the operation
+    /// - `owner` - Restricts clearance to owners only
+    /// - `access` - Extends clearance to access-list entities
+    /// - `bypass` - Skips the clearance check entirely (**WARNING:** grants
+    ///   full owner-level clearance to any caller)
+    pub const Override = enum {
+        default,
+        owner,
+        access,
+        bypass,
+
+        /// # Resolves the Override Against the Built-In Clearance Policy
+        /// **Remarks:** Intended for internal use only
+        fn ownerOnly(self: Override, default: bool) bool {
+            return switch (self) {
+                .default => default,
+                .owner => true,
+                .access => false,
+                .bypass => unreachable // Callers must skip clearance first
+            };
+        }
+    };
+
     /// # Puts a New Object into the Bucket
     /// - `c_name` - Name of the object container (e.g., `user_img`)
     /// - `name` - Name of the object (e.g., `profile_img.jpg`)
@@ -548,20 +639,32 @@ pub const Object = struct {
     /// - `c_name` - Name of the object container (e.g., `user_img`)
     /// - `uuid` - UUID of the object
     /// - `access` - Either an entity or **null** for public object
+    /// - `override` - Clearance override (see `Override`)
     ///
     /// **WARNING:** Return value must be freed by the caller.
     pub fn get(
         self: *Object,
         comptime c_name: Str,
         uuid: Str,
-        access: ?Str
+        access: ?Str,
+        override: Override
     ) !Str {
         const conn = try self.parent.acquire();
         defer conn.release();
 
-        const crud = try conn.stmt(.find_data, c_name);
+        var txn = try Txn.read(&conn.db);
+        errdefer txn.rollback();
 
+        // The ACL is checked on the lean info view first — the blob is only
+        // pulled for cleared reads, so denied reads never pay the transfer
+        var session = try authorize(
+            conn, c_name, uuid, access, override, false
+        );
+        defer session.free();
+
+        const crud = try conn.stmt(.find_data, c_name);
         const filter = schema.Filter {.uuid = uuid};
+
         var result = crud.readOne(schema.ViewData, filter) catch |err| {
             crud.reset() catch {};
             return err;
@@ -569,18 +672,14 @@ pub const Object = struct {
 
         const rec = result orelse return Error.NotFound;
 
-        if (clearance(rec, access, false) == .none) {
-            crud.free(result);
-            crud.reset() catch {};
-            return Error.AccessDenied;
-        }
-
         // Transfers the heap-owned blob, avoiding a redundant copy
         const out = rec.data;
         result.?.data = "";
 
         crud.free(result);
         crud.reset() catch {};
+
+        try txn.commit();
         return out;
     }
 
@@ -594,14 +693,23 @@ pub const Object = struct {
         uuid: Str,
         owner: Str,
         entity: Str,
-        comptime erase: bool
+        comptime erase: bool,
+        override: Override
     ) !void {
         const heap = self.parent.heap;
 
         const conn = try self.parent.acquire();
         defer conn.release();
 
-        var session = try authorize(conn, c_name, uuid, owner, true);
+        // The ACL snapshot and the list rewrite must commit atomically —
+        // otherwise concurrent pool connections interleave read and write,
+        // and the last writer clobbers the other's list entry
+        var txn = try Txn.write(&conn.db);
+        errdefer txn.rollback();
+
+        var session = try authorize(
+            conn, c_name, uuid, owner, override, true
+        );
         defer session.free();
 
         var list: ArrayList(Str) = .empty;
@@ -646,6 +754,8 @@ pub const Object = struct {
             crud.reset() catch {};
             return err;
         };
+
+        try txn.commit();
     }
 
     /// # Adds Owner to an Object
@@ -653,15 +763,24 @@ pub const Object = struct {
     /// - `uuid` - UUID of the object
     /// - `owner` - Existing owner entity string
     /// - `entity` - New owner entity string
+    /// - `override` - Clearance override (see `Override`)
     pub fn addOwner(
         self: *Object,
         comptime c_name: Str,
         uuid: Str,
         owner: Str,
         entity: Str,
+        override: Override
     ) !void {
         return self.mutateList(
-            schema.ModelOwner, "owner", c_name, uuid, owner, entity, false
+            schema.ModelOwner,
+            "owner",
+            c_name,
+            uuid,
+            owner,
+            entity,
+            false,
+            override
         );
     }
 
@@ -670,15 +789,24 @@ pub const Object = struct {
     /// - `uuid` - UUID of the object
     /// - `owner` - Existing owner entity string
     /// - `entity` - Existing owner entity string
+    /// - `override` - Clearance override (see `Override`)
     pub fn removeOwner(
         self: *Object,
         comptime c_name: Str,
         uuid: Str,
         owner: Str,
         entity: Str,
+        override: Override
     ) !void {
         return self.mutateList(
-            schema.ModelOwner, "owner", c_name, uuid, owner, entity, true
+            schema.ModelOwner,
+            "owner",
+            c_name,
+            uuid,
+            owner,
+            entity,
+            true,
+            override
         );
     }
 
@@ -687,15 +815,24 @@ pub const Object = struct {
     /// - `uuid` - UUID of the object
     /// - `owner` - Existing owner entity string
     /// - `entity` - New access entity string
+    /// - `override` - Clearance override (see `Override`)
     pub fn addAccess(
         self: *Object,
         comptime c_name: Str,
         uuid: Str,
         owner: Str,
         entity: Str,
+        override: Override
     ) !void {
         return self.mutateList(
-            schema.ModelAccess, "access", c_name, uuid, owner, entity, false
+            schema.ModelAccess,
+            "access",
+            c_name,
+            uuid,
+            owner,
+            entity,
+            false,
+            override
         );
     }
 
@@ -704,15 +841,24 @@ pub const Object = struct {
     /// - `uuid` - UUID of the object
     /// - `owner` - Existing owner entity string
     /// - `entity` - Existing access entity string
+    /// - `override` - Clearance override (see `Override`)
     pub fn removeAccess(
         self: *Object,
         comptime c_name: Str,
         uuid: Str,
         owner: Str,
         entity: Str,
+        override: Override
     ) !void {
         return self.mutateList(
-            schema.ModelAccess, "access", c_name, uuid, owner, entity, true
+            schema.ModelAccess,
+            "access",
+            c_name,
+            uuid,
+            owner,
+            entity,
+            true,
+            override
         );
     }
 
@@ -720,16 +866,23 @@ pub const Object = struct {
     /// - `c_name` - Name of the object container (e.g., `user_img`)
     /// - `uuid` - UUID of the object
     /// - `access` - Either an entity or **null** for public object
+    /// - `override` - Clearance override (see `Override`)
     pub fn remove(
         self: *Object,
         comptime c_name: Str,
         uuid: Str,
-        access: ?Str
+        access: ?Str,
+        override: Override
     ) !void {
         const conn = try self.parent.acquire();
         defer conn.release();
 
-        var session = try authorize(conn, c_name, uuid, access, true);
+        var txn = try Txn.write(&conn.db);
+        errdefer txn.rollback();
+
+        var session = try authorize(
+            conn, c_name, uuid, access, override, true
+        );
         defer session.free();
 
         const crud = try conn.stmt(.remove, c_name);
@@ -739,6 +892,8 @@ pub const Object = struct {
             crud.reset() catch {};
             return err;
         };
+
+        try txn.commit();
     }
 
     /// # Generic Fetch Result (Single Query)
@@ -773,6 +928,7 @@ pub const Object = struct {
     /// - `c_name` - Name of the object container (e.g., `user_img`)
     /// - `uuid` - UUID of the object
     /// - `access` - Either an entity or **null** for public object
+    /// - `override` - Clearance override (see `Override`)
     ///
     /// **Remarks:** Only owners and public objects are permitted
     ///
@@ -781,12 +937,13 @@ pub const Object = struct {
         self: *Object,
         comptime c_name: Str,
         uuid: Str,
-        access: ?Str
+        access: ?Str,
+        override: Override
     ) !Info {
         const conn = try self.parent.acquire();
         defer conn.release();
 
-        return authorize(conn, c_name, uuid, access, true);
+        return authorize(conn, c_name, uuid, access, override, true);
     }
 
     /// # Fetches the ACL-Validated Object Record (Single Query)
@@ -796,13 +953,17 @@ pub const Object = struct {
         comptime c_name: Str,
         uuid: Str,
         access: ?Str,
-        owner_only: bool
+        override: Override,
+        owner_default: bool
     ) !Info {
         var session = try fetch(conn, c_name, uuid);
         errdefer session.free();
 
-        if (clearance(session.rec, access, owner_only) == .none) {
-            return Error.AccessDenied;
+        if (override != .bypass) {
+            const level = clearance(
+                session.rec, access, override.ownerOnly(owner_default)
+            );
+            if (level == .none) return Error.AccessDenied;
         }
 
         return session;
@@ -904,6 +1065,7 @@ pub const Object = struct {
     /// - `rid` - RowId of the object (must match the `uuid` record)
     /// - `uuid` - UUID of the object
     /// - `access` - Either an entity or **null** for public object
+    /// - `override` - Clearance override (see `Override`)
     ///
     /// **Remarks:** Streams open as **Read-Write** only for owners, otherwise
     /// **Read-Only** (access entities and public objects included). The `rid`
@@ -917,7 +1079,8 @@ pub const Object = struct {
         comptime c_name: StrZ,
         rid: i64,
         uuid: Str,
-        access: ?Str
+        access: ?Str,
+        override: Override
     ) !BlobStream {
         const conn = try self.parent.acquire();
         errdefer conn.release();
@@ -925,13 +1088,22 @@ pub const Object = struct {
         var session = try fetch(conn, c_name, uuid);
         defer session.free();
 
-        const level = clearance(session.rec, access, false);
-        if (level == .none) return Error.AccessDenied;
+        // Bypassed streams open as read-write — full owner-level clearance
+        var level: Access = .write;
+        if (override != .bypass) {
+            level = clearance(session.rec, access, override.ownerOnly(false));
+            if (level == .none) return Error.AccessDenied;
+        }
 
         // Rejects stale rowids (e.g., after a concurrent remove and re-insert)
         if (session.rec.rowid != rid) return Error.NotFound;
 
-        // The connection stays checked out until `closeStream()` is called
+        // No transaction here: an open blob handle holds an implicit write
+        // transaction until it is closed, so a write lock taken now would
+        // block every other writer for the whole stream lifetime. A row
+        // removed between the check and the open simply fails the blob open
+        // on the vanished rowid — it cannot open a foreign record silently
+        // unless that rowid is deleted *and* reused within this window
         return BlobStream.open(
             &conn.db, c_name, "data", rid,
             if (level == .write) .ReadWrite else .Read
@@ -960,9 +1132,9 @@ pub const Object = struct {
     /// - `part` - Buffer that the data fragment is read into
     ///
     /// **Remarks:** Returns **null** at the end of the stream, otherwise the
-    /// fragment read from the current cursor position
+    /// fragment read from the current cursor position — a buffer larger than
+    /// the remaining data yields a partial read instead of an error
     pub fn incRead(stream: *BlobStream, part: []u8) !?Str {
-        if (stream.size() < part.len) return error.FragmentTooBig;
         return try stream.read(part);
     }
 };
@@ -1097,11 +1269,11 @@ test "pooled connections serve concurrent operations" {
 
                 const uuid = try obj.put("parallel", name, payload, &.{}, &.{});
 
-                const blob = try obj.get("parallel", &uuid, null);
+                const blob = try obj.get("parallel", &uuid, null, .default);
                 defer heap.free(blob);
                 try testing.expectEqualStrings(payload, blob);
 
-                try obj.remove("parallel", &uuid, null);
+                try obj.remove("parallel", &uuid, null, .default);
             }
         }
     };
@@ -1130,24 +1302,30 @@ test "object put, get and remove with ACL" {
     const uuid = try obj.put("docs", "doc.txt", "Hello, Sloop!", &.{"alice"}, &.{"bob"});
 
     // Owner and listed access can read
-    const owned = try obj.get("docs", &uuid, "alice");
+    const owned = try obj.get("docs", &uuid, "alice", .default);
     defer testing.allocator.free(owned);
     try testing.expectEqualStrings("Hello, Sloop!", owned);
 
-    const shared = try obj.get("docs", &uuid, "bob");
+    const shared = try obj.get("docs", &uuid, "bob", .default);
     defer testing.allocator.free(shared);
     try testing.expectEqualStrings("Hello, Sloop!", shared);
 
     // Unknown entities and public access are denied
-    try testing.expectError(Error.AccessDenied, obj.get("docs", &uuid, "eve"));
-    try testing.expectError(Error.AccessDenied, obj.get("docs", &uuid, null));
+    try testing.expectError(
+        Error.AccessDenied, obj.get("docs", &uuid, "eve", .default)
+    );
+    try testing.expectError(
+        Error.AccessDenied, obj.get("docs", &uuid, null, .default)
+    );
 
     // Unknown uuid is not found
     const ghost = try Uuid.toUrn(&(try Uuid.new(testing.io)));
-    try testing.expectError(Error.NotFound, obj.get("docs", &ghost, "alice"));
+    try testing.expectError(
+        Error.NotFound, obj.get("docs", &ghost, "alice", .default)
+    );
 
     // Info reflects the stored record
-    var info = try obj.info("docs", &uuid, "alice");
+    var info = try obj.info("docs", &uuid, "alice", .default);
     defer info.free();
 
     try testing.expectEqualStrings("doc.txt", info.value().name);
@@ -1155,9 +1333,13 @@ test "object put, get and remove with ACL" {
     try testing.expectEqual(@as(usize, 1), info.value().owner.len);
 
     // Only the owner removes
-    try testing.expectError(Error.AccessDenied, obj.remove("docs", &uuid, "bob"));
-    try obj.remove("docs", &uuid, "alice");
-    try testing.expectError(Error.NotFound, obj.get("docs", &uuid, "alice"));
+    try testing.expectError(
+        Error.AccessDenied, obj.remove("docs", &uuid, "bob", .default)
+    );
+    try obj.remove("docs", &uuid, "alice", .default);
+    try testing.expectError(
+        Error.NotFound, obj.get("docs", &uuid, "alice", .default)
+    );
 }
 
 test "public object access" {
@@ -1170,13 +1352,18 @@ test "public object access" {
 
     const uuid = try obj.put("docs", "pub.txt", "open data", &.{}, &.{});
 
-    const data = try obj.get("docs", &uuid, null);
+    const data = try obj.get("docs", &uuid, null, .default);
     defer testing.allocator.free(data);
     try testing.expectEqualStrings("open data", data);
 
     // Public objects cannot be administered nor entity-accessed
-    try testing.expectError(Error.AccessDenied, obj.addOwner("docs", &uuid, "eve", "mallory"));
-    try testing.expectError(Error.AccessDenied, obj.get("docs", &uuid, "eve"));
+    try testing.expectError(
+        Error.AccessDenied,
+        obj.addOwner("docs", &uuid, "eve", "mallory", .default)
+    );
+    try testing.expectError(
+        Error.AccessDenied, obj.get("docs", &uuid, "eve", .default)
+    );
 }
 
 test "repeated operations reuse prepared statements" {
@@ -1203,38 +1390,38 @@ test "repeated operations reuse prepared statements" {
 
         const uuid = try obj.put("reused", name, payload, &.{"alice"}, &.{"bob"});
 
-        const blob = try obj.get("reused", &uuid, "bob");
+        const blob = try obj.get("reused", &uuid, "bob", .default);
         defer testing.allocator.free(blob);
         try testing.expectEqualStrings(payload, blob);
 
-        var info = try obj.info("reused", &uuid, "alice");
+        var info = try obj.info("reused", &uuid, "alice", .default);
         defer info.free();
         try testing.expectEqualStrings(name, info.value().name);
 
-        try obj.addAccess("reused", &uuid, "alice", "carol");
-        try obj.removeAccess("reused", &uuid, "alice", "carol");
+        try obj.addAccess("reused", &uuid, "alice", "carol", .default);
+        try obj.removeAccess("reused", &uuid, "alice", "carol", .default);
 
-        try obj.remove("reused", &uuid, "alice");
+        try obj.remove("reused", &uuid, "alice", .default);
     }
 
     // Interleaved lookups on two live records through the shared statements
     const first = try obj.put("reused", "one.txt", "one", &.{}, &.{});
     const second = try obj.put("reused", "two.txt", "two", &.{}, &.{});
 
-    const data_two = try obj.get("reused", &second, null);
+    const data_two = try obj.get("reused", &second, null, .default);
     defer testing.allocator.free(data_two);
     try testing.expectEqualStrings("two", data_two);
 
-    const data_one = try obj.get("reused", &first, null);
+    const data_one = try obj.get("reused", &first, null, .default);
     defer testing.allocator.free(data_one);
     try testing.expectEqualStrings("one", data_one);
 
-    const again = try obj.get("reused", &second, null);
+    const again = try obj.get("reused", &second, null, .default);
     defer testing.allocator.free(again);
     try testing.expectEqualStrings("two", again);
 
-    try obj.remove("reused", &first, null);
-    try obj.remove("reused", &second, null);
+    try obj.remove("reused", &first, null, .default);
+    try obj.remove("reused", &second, null, .default);
 }
 
 test "owner and access management" {
@@ -1248,31 +1435,47 @@ test "owner and access management" {
     const uuid = try obj.put("docs", "doc.txt", "payload", &.{"alice"}, &.{});
 
     // Non-owners cannot manage owners nor access
-    try testing.expectError(Error.AccessDenied, obj.addOwner("docs", &uuid, "eve", "mallory"));
-    try testing.expectError(Error.AccessDenied, obj.addAccess("docs", &uuid, "eve", "bob"));
+    try testing.expectError(
+        Error.AccessDenied,
+        obj.addOwner("docs", &uuid, "eve", "mallory", .default)
+    );
+    try testing.expectError(
+        Error.AccessDenied,
+        obj.addAccess("docs", &uuid, "eve", "bob", .default)
+    );
 
-    try obj.addOwner("docs", &uuid, "alice", "carol");
-    try obj.addOwner("docs", &uuid, "alice", "carol"); // Duplicate is a no-op
+    try obj.addOwner("docs", &uuid, "alice", "carol", .default);
 
-    var info = try obj.info("docs", &uuid, "alice");
+    // Duplicate is a no-op
+    try obj.addOwner("docs", &uuid, "alice", "carol", .default);
+
+    var info = try obj.info("docs", &uuid, "alice", .default);
     defer info.free();
     try testing.expectEqual(@as(usize, 2), info.value().owner.len);
 
-    try obj.addAccess("docs", &uuid, "alice", "bob");
-    const shared = try obj.get("docs", &uuid, "bob");
+    try obj.addAccess("docs", &uuid, "alice", "bob", .default);
+    const shared = try obj.get("docs", &uuid, "bob", .default);
     defer testing.allocator.free(shared);
     try testing.expectEqualStrings("payload", shared);
 
-    try obj.removeAccess("docs", &uuid, "alice", "bob");
-    try testing.expectError(Error.AccessDenied, obj.get("docs", &uuid, "bob"));
+    try obj.removeAccess("docs", &uuid, "alice", "bob", .default);
+    try testing.expectError(
+        Error.AccessDenied, obj.get("docs", &uuid, "bob", .default)
+    );
 
     // Removing an unknown entity fails
-    try testing.expectError(Error.MissingEntity, obj.removeOwner("docs", &uuid, "alice", "eve"));
+    try testing.expectError(
+        Error.MissingEntity,
+        obj.removeOwner("docs", &uuid, "alice", "eve", .default)
+    );
 
-    try obj.removeOwner("docs", &uuid, "alice", "carol");
+    try obj.removeOwner("docs", &uuid, "alice", "carol", .default);
 
     // Refuses to remove the last owner, keeping the object manageable
-    try testing.expectError(Error.MissingOwnership, obj.removeOwner("docs", &uuid, "alice", "alice"));
+    try testing.expectError(
+        Error.MissingOwnership,
+        obj.removeOwner("docs", &uuid, "alice", "alice", .default)
+    );
 }
 
 test "provision and stream I/O bounds" {
@@ -1283,21 +1486,26 @@ test "provision and stream I/O bounds" {
     try containers.create("media");
     var obj = s.object();
 
-    const uuid = try obj.provision("media", "clip.bin", 16, &.{"alice"}, &.{"bob"});
+    const uuid = try obj.provision(
+        "media", "clip.bin", 16, &.{"alice"}, &.{"bob"}
+    );
 
-    var info = try obj.info("media", &uuid, "alice");
+    var info = try obj.info("media", &uuid, "alice", .default);
     defer info.free();
 
     const rid = info.value().rowid;
     try testing.expectEqual(@as(i64, 16), info.value().size);
 
     // Stale or foreign rowid is rejected
-    try testing.expectError(Error.NotFound, obj.openStream("media", rid + 1, &uuid, "alice"));
+    try testing.expectError(
+        Error.NotFound,
+        obj.openStream("media", rid + 1, &uuid, "alice", .default)
+    );
 
     // Owners stream read-write — the stream holds the pool's only
     // connection (in-memory), so it is closed before any other operation
     {
-        var writer = try obj.openStream("media", rid, &uuid, "alice");
+        var writer = try obj.openStream("media", rid, &uuid, "alice", .default);
         defer Object.closeStream(&writer);
 
         try Object.incWrite(&writer, "hello", 0);
@@ -1317,21 +1525,31 @@ test "provision and stream I/O bounds" {
 
     // Access-listed entities stream read-only
     {
-        var viewer = try obj.openStream("media", rid, &uuid, "bob");
+        var viewer = try obj.openStream("media", rid, &uuid, "bob", .default);
         defer Object.closeStream(&viewer);
 
-        try testing.expectError(error.Locked, Object.incWrite(&viewer, "XX", 0));
+        try testing.expectError(
+            error.Locked, Object.incWrite(&viewer, "XX", 0)
+        );
 
         var buffer: [4]u8 = undefined;
-        try testing.expectEqualStrings("hell", (try Object.incRead(&viewer, &buffer)).?);
-        try testing.expectEqualStrings("owor", (try Object.incRead(&viewer, &buffer)).?);
-        try testing.expectEqualStrings("ld\x00\x00", (try Object.incRead(&viewer, &buffer)).?);
-        try testing.expectEqualStrings("\x00\x00\x00\x00", (try Object.incRead(&viewer, &buffer)).?);
-        try testing.expect((try Object.incRead(&viewer, &buffer)) == null);
+        try testing.expectEqualStrings(
+            "hell", (try Object.incRead(&viewer, &buffer)).?
+        );
+        try testing.expectEqualStrings(
+            "owor", (try Object.incRead(&viewer, &buffer)).?
+        );
+        try testing.expectEqualStrings(
+            "ld\x00\x00", (try Object.incRead(&viewer, &buffer)).?
+        );
 
-        // Read buffer bigger than the object is rejected
+        // Buffer larger than the remaining data yields a partial read
         var big_read: [17]u8 = @splat('A');
-        try testing.expectError(error.FragmentTooBig, Object.incRead(&viewer, &big_read));
+        const tail = (try Object.incRead(&viewer, &big_read)).?;
+        try testing.expectEqualStrings("\x00\x00\x00\x00", tail);
+
+        try testing.expect((try Object.incRead(&viewer, &buffer)) == null);
+        try testing.expect((try Object.incRead(&viewer, &big_read)) == null);
     }
 }
 
@@ -1343,9 +1561,11 @@ test "stream write requires ownership" {
     try containers.create("media");
     var obj = s.object();
 
-    const uuid = try obj.provision("media", "clip.bin", 16, &.{"alice"}, &.{"bob"});
+    const uuid = try obj.provision(
+        "media", "clip.bin", 16, &.{"alice"}, &.{"bob"}
+    );
 
-    var info = try obj.info("media", &uuid, "alice");
+    var info = try obj.info("media", &uuid, "alice", .default);
     defer info.free();
 
     const rid = info.value().rowid;
@@ -1354,28 +1574,81 @@ test "stream write requires ownership" {
     // pool's only connection (in-memory), so it is closed before the next
     // provision
     {
-        var viewer = try obj.openStream("media", rid, &uuid, "bob");
+        var viewer = try obj.openStream("media", rid, &uuid, "bob", .default);
         defer Object.closeStream(&viewer);
 
-        try testing.expectError(error.Locked, Object.incWrite(&viewer, "XX", 0));
+        try testing.expectError(
+            error.Locked, Object.incWrite(&viewer, "XX", 0)
+        );
     }
 
     // Public objects stream read-only for everyone
     const pub_uuid = try obj.provision("media", "open.bin", 16, &.{}, &.{});
 
-    var pub_info = try obj.info("media", &pub_uuid, null);
+    var pub_info = try obj.info("media", &pub_uuid, null, .default);
     defer pub_info.free();
 
     {
-        var public = try obj.openStream("media", pub_info.value().rowid, &pub_uuid, null);
+        var public = try obj.openStream(
+            "media", pub_info.value().rowid, &pub_uuid, null, .default
+        );
         defer Object.closeStream(&public);
 
-        try testing.expectError(error.Locked, Object.incWrite(&public, "XX", 0));
+        try testing.expectError(
+            error.Locked, Object.incWrite(&public, "XX", 0)
+        );
     }
 
-    const data = try obj.get("media", &pub_uuid, null);
+    const data = try obj.get("media", &pub_uuid, null, .default);
     defer testing.allocator.free(data);
     try testing.expectEqual(@as(usize, 16), data.len);
+}
+
+test "clearance override" {
+    var s = try testSloop();
+    defer s.deinit();
+
+    var containers = s.bucket();
+    try containers.create("docs");
+    var obj = s.object();
+
+    const uuid = try obj.put(
+        "docs", "doc.txt", "payload", &.{"alice"}, &.{"bob"}
+    );
+
+    // `owner` tightens clearance — listed access is denied
+    try testing.expectError(
+        Error.AccessDenied, obj.get("docs", &uuid, "bob", .owner)
+    );
+    try testing.expectError(
+        Error.AccessDenied, obj.openStream("docs", 0, &uuid, "bob", .owner)
+    );
+
+    // `access` relaxes clearance — listed access gains owner-only operations
+    try obj.addOwner("docs", &uuid, "bob", "carol", .access);
+
+    // `default` keeps the built-in policy of the operation
+    try testing.expectError(
+        Error.AccessDenied,
+        obj.addAccess("docs", &uuid, "eve", "mallory", .default)
+    );
+
+    // `bypass` skips the clearance check entirely
+    var info = try obj.info("docs", &uuid, "eve", .bypass);
+    defer info.free();
+    try testing.expectEqualStrings("doc.txt", info.value().name);
+
+    {
+        var stranger = try obj.openStream(
+            "docs", info.value().rowid, &uuid, "eve", .bypass
+        );
+        defer Object.closeStream(&stranger);
+    }
+
+    try obj.remove("docs", &uuid, "eve", .bypass);
+    try testing.expectError(
+        Error.NotFound, obj.get("docs", &uuid, "alice", .bypass)
+    );
 }
 
 test "scan iterates container records progressively" {

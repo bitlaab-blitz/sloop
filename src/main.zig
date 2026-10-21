@@ -39,11 +39,11 @@ pub fn main(init: std.process.Init) !void {
     const put_uuid = try obj.put(
         "test_img1", "put.txt", "Hello, Sloop!", &.{}, &.{}
     );
-    const blob = try obj.get("test_img1", &put_uuid, null);
+    const blob = try obj.get("test_img1", &put_uuid, null, .default);
     defer sloop.heap.free(blob);
     std.debug.print("{s}\n", .{blob});
 
-    try obj.remove("test_img1", &put_uuid, null);
+    try obj.remove("test_img1", &put_uuid, null, .default);
 
     // Creates a provisional object in the bucket
 
@@ -60,14 +60,14 @@ pub fn main(init: std.process.Init) !void {
     // Gets object info from the bucket
 
     // Private object — only owners are permitted
-    var info = try obj.info("test_img1", &uuid, "john");
+    var info = try obj.info("test_img1", &uuid, "john", .default);
     defer info.free();
 
     std.debug.print("Info: {s} | {d} bytes\n", .
         {info.value().name, info.value().size});
 
     // Public object — readable without an entity
-    var info2 = try obj.info("test_img1", &uuid2, null);
+    var info2 = try obj.info("test_img1", &uuid2, null, .default);
     defer info2.free();
 
     std.debug.print("Info: {s} | {d} bytes\n", .
@@ -79,48 +79,71 @@ pub fn main(init: std.process.Init) !void {
     // the record again
     {
         const rid = info.value().rowid;
-        var blob_writer = try obj.openStream("test_img1", rid, &uuid, "john");
+        var blob_writer = try obj.openStream("test_img1", rid, &uuid, "john", .default);
         defer Sloop.Object.closeStream(&blob_writer);
 
         try Sloop.Object.incWrite(&blob_writer, "hello", 2);
 
         // Incrementally reads out of the provisional object (access stream —
         // access entities hold read-only streams)
-        var blob_reader = try obj.openStream("test_img1", rid, &uuid, "jane");
+        var blob_reader = try obj.openStream("test_img1", rid, &uuid, "jane", .default);
         defer Sloop.Object.closeStream(&blob_reader);
 
         var buffer: [128]u8 = undefined;
-        while (try Sloop.Object.incRead(&blob_reader, &buffer)) |data| {
-            std.debug.print("Chunk: {s}\n", .{data});
+        const head = (try Sloop.Object.incRead(&blob_reader, &buffer)).?;
+        std.debug.print("Chunk: {s}\n", .{head});
+
+        // A buffer larger than the remaining data yields a partial read
+        var big: [2048]u8 = undefined;
+        const tail = (try Sloop.Object.incRead(&blob_reader, &big)).?;
+        std.debug.print("Tail: {d} bytes\n", .{tail.len});
+
+        if (try Sloop.Object.incRead(&blob_reader, &buffer)) |_| {
+            std.debug.print("ERROR: stream did not end!\n", .{});
         }
     }
 
     // Reads back the incrementally written region through the whole-object
     // interface, proving the streamed bytes were committed
-    const written = try obj.get("test_img1", &uuid, "john");
+    const written = try obj.get("test_img1", &uuid, "john", .default);
     defer sloop.heap.free(written);
     std.debug.print("Streamed: {s}\n", .{written[2..7]});
 
     // Manages owners and access on the provisional object
-    try obj.addOwner("test_img1", &uuid, "john", "doe");
-    try obj.addAccess("test_img1", &uuid, "john", "sam");
+    try obj.addOwner("test_img1", &uuid, "john", "doe", .default);
+    try obj.addAccess("test_img1", &uuid, "john", "sam", .default);
 
-    try obj.removeAccess("test_img1", &uuid, "john", "sam");
-    try obj.removeOwner("test_img1", &uuid, "john", "doe");
+    try obj.removeAccess("test_img1", &uuid, "john", "sam", .default);
+    try obj.removeOwner("test_img1", &uuid, "john", "doe", .default);
 
     // Refuses to remove the last owner
-    if (obj.removeOwner("test_img1", &uuid, "john", "john")) |_| {
+    if (obj.removeOwner("test_img1", &uuid, "john", "john", .default)) |_| {
         std.debug.print("ERROR: last owner was removed!\n", .{});
     } else |err| {
         std.debug.print("Refused: {s}\n", .{@errorName(err)});
     }
 
     // Access is denied for entities outside the owner and access lists
-    if (obj.get("test_img1", &uuid, "mallory")) |_| {
+    if (obj.get("test_img1", &uuid, "mallory", .default)) |_| {
         std.debug.print("ERROR: stranger read a private object!\n", .{});
     } else |err| {
         std.debug.print("Denied for mallory: {s}\n", .{@errorName(err)});
     }
+
+    // Clearance overrides — `.owner` tightens the policy (jane is access-only
+    // and loses read), `.access` relaxes it (jane may administer the object)
+    if (obj.get("test_img1", &uuid, "jane", .owner)) |_| {
+        std.debug.print("ERROR: access entity cleared by owner override!\n", .{});
+    } else |err| {
+        std.debug.print("Tightened: {s}\n", .{@errorName(err)});
+    }
+
+    try obj.addAccess("test_img1", &uuid, "jane", "doe", .access);
+
+    var info3 = try obj.info("test_img1", &uuid, "doe", .access);
+    defer info3.free();
+    std.debug.print("Relaxed: {s} | {d} bytes\n", .
+        {info3.value().name, info3.value().size});
 
     // Scans the object container (progressive row cursor)
     var cursor = try bucket.scan("test_img1");
