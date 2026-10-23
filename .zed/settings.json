@@ -4,12 +4,14 @@
 {
     "lsp": {
         "zls": {
-            "binary": {
-                "path": "/home/al-mehedi/zls/zig-out/bin/zls"
-            },
+            // # Optional: custom zls path (defaults to zls on PATH)
+            // "binary": {
+            //     "path": "/home/<user>/zls/zig-out/bin/zls"
+            // },
             "settings": {
                 "zls": {
-                    "zig_exe_path": "/home/al-mehedi/zig/zig",
+                    // # Optional: custom zig path (defaults to zig on PATH)
+                    // "zig_exe_path": "/home/<user>/zig/zig",
                     "enable_build_on_save": true,
                     "build_on_save_step": "install"
                 }
