@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .quill = .{
-            .url = "https://github.com/bitlaab-bolt/quill/archive/refs/tags/v1.2.1.zip",
-            .hash = "quill-1.2.0-JK-lzcdDmQBZFc2bY6YgtDRWqXVSOly5Knh29uAU4J-b",
+            .url = "https://github.com/bitlaab-bolt/quill/archive/refs/tags/v1.2.2.zip",
+            .hash = "quill-1.2.2-JK-lzcxGmQDuGtiBfvB6xKcJ4BqDaYryiQiUjkIt0tq7",
         },
     },
     .paths = .{
