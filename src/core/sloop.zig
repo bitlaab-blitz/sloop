@@ -27,7 +27,8 @@ const Error = error {
 
 /// # Identifies a Pre-parable Statement for a Container
 const Stmt = enum {
-    find_info, find_data, insert, remove, update_owner, update_access
+    find_info, find_data, insert, remove, update_owner, update_access,
+    update_record
 };
 
 /// # Lazily Prepared Statements of an Object Container
@@ -41,6 +42,7 @@ const StmtCache = struct {
     remove: ?Quill.CRUD = null,
     update_owner: ?Quill.CRUD = null,
     update_access: ?Quill.CRUD = null,
+    update_record: ?Quill.CRUD = null
 };
 
 io: Io,
@@ -207,6 +209,14 @@ const Conn = struct {
 
                 sql.when(&.{sql.filter("uuid", .@"=", null)});
                 break :blk sql.statement();
+            },
+            .update_record => blk: {
+                var sql = Qb.Record.update(
+                    schema.Model, schema.Filter, c_name, .Exact
+                );
+
+                sql.when(&.{sql.filter("uuid", .@"=", null)});
+                break :blk sql.statement();
             }
         };
 
@@ -367,10 +377,6 @@ pub fn deinit(self: *Self) void {
     Quill.deinit();
 }
 
-/// # Creates Indexes on Object Containers
-/// **Remarks:** SQLite index names are database-global, so each container
-/// gets its own uniquely named index — a shared name would make
-/// `IF NOT EXISTS` silently skip every container after the first
 /// # Doubles Double-Quotes of a SQL Identifier for Quoting
 /// **Remarks:** Returns the escaped text **without** surrounding quotes —
 /// call sites embed it inside their own quote pairs. Container names are
@@ -391,6 +397,10 @@ fn escapeSqlIdent(self: *Self, name: Str) ![]u8 {
     return out.toOwnedSlice(self.heap);
 }
 
+/// # Creates Indexes on Object Containers
+/// **Remarks:** SQLite index names are database-global, so each container
+/// gets its own uniquely named index — a shared name would make
+/// `IF NOT EXISTS` silently skip every container after the first
 pub fn setIndex(self: *Self) !void {
     const conn = try self.acquire();
     defer conn.release();
@@ -1060,6 +1070,130 @@ pub const Object = struct {
         return uuid;
     }
 
+    /// # Shared Upsert Under a Caller-Supplied UUID
+    /// **Remarks:** Intended for internal use only. `rec` must bind
+    /// every named parameter of the container's insert and update
+    /// statements — both `schema.Model` and `schema.ModelProvision`
+    /// satisfy this
+    fn upsertWith(
+        self: *Object,
+        comptime c_name: Str,
+        uuid: Str,
+        rec: anytype
+    ) !void {
+        const conn = try self.parent.acquire();
+        defer conn.release();
+
+        var txn = try Txn.write(&conn.db);
+        errdefer txn.rollback();
+
+        // Existence is checked on the same write-locked connection, so
+        // a concurrent writer cannot slip an insert between the check
+        // and the write
+        const exists = blk: {
+            var session = fetch(conn, c_name, uuid) catch |err| {
+                if (err != Error.NotFound) return err;
+                break :blk false;
+            };
+
+            session.free();
+            break :blk true;
+        };
+
+        if (exists) {
+            const crud = try conn.stmt(.update_record, c_name);
+            const filter = schema.Filter {.uuid = uuid};
+
+            crud.exec(rec, filter, null) catch |err| {
+                crud.reset() catch {};
+                return err;
+            };
+        } else {
+            const crud = try conn.stmt(.insert, c_name);
+
+            crud.exec(rec, null, null) catch |err| {
+                crud.reset() catch {};
+                return err;
+            };
+        }
+
+        try txn.commit();
+    }
+
+    /// # Upserts a Provisional Object Record under a Caller-Supplied UUID
+    /// - `c_name` - Name of the object container (e.g., `user_img`)
+    /// - `uuid` - Caller-supplied uuid (URN) of the object
+    /// - `name` - Name of the object (e.g., `profile_img.jpg`)
+    /// - `size` - Provisional data size of the given object
+    /// - `owner` - One or more entity, (e.g., `&.{}`) for public uploads
+    /// - `access` - One or more entity, (e.g., `&.{}`) for public access
+    /// - `cat` - Caller-supplied creation timestamp of the object
+    ///
+    /// **Remarks:** Re-provisioning an existing uuid resets its blob to a
+    /// zero blob of the given size. The caller-supplied `uuid` and `cat`
+    /// are stored as-is — intended for replica/sync flows where record
+    /// identity and timestamps are owned by the caller.
+    ///
+    /// **WARNING:** The caller must ensure `uuid` is a well-formed URN —
+    /// it is stored without validation
+    pub fn provisionWith(
+        self: *Object,
+        comptime c_name: Str,
+        uuid: Str,
+        name: Str,
+        size: u32,
+        owner: []const Str,
+        access: []const Str,
+        cat: i64
+    ) !void {
+        return self.upsertWith(c_name, uuid, schema.ModelProvision {
+            .uuid = .{.text = uuid},
+            .name = .{.text = name},
+            .data = .{.blob_len = @intCast(size)},
+            .owner = .{.text = owner},
+            .access = .{.text = access},
+            .size = @intCast(size),
+            .cat = cat
+        });
+    }
+
+    /// # Upserts an Object Record under a Caller-Supplied UUID
+    /// - `c_name` - Name of the object container (e.g., `user_img`)
+    /// - `uuid` - Caller-supplied uuid (URN) of the object
+    /// - `name` - Name of the object (e.g., `profile_img.jpg`)
+    /// - `data` - Octet data of the given object
+    /// - `owner` - One or more entity, (e.g., `&.{}`) for public uploads
+    /// - `access` - One or more entity, (e.g., `&.{}`) for public access
+    /// - `cat` - Caller-supplied creation timestamp of the object
+    ///
+    /// **Remarks:** The caller-supplied `uuid` and `cat` are stored
+    /// as-is — intended for replica/sync flows where record identity and
+    /// timestamps are owned by the caller. The stored `size` reflects
+    /// the given data.
+    ///
+    /// **WARNING:** The caller must ensure `uuid` is a well-formed URN —
+    /// it is stored without validation
+    pub fn putWith(
+        self: *Object,
+        comptime c_name: Str,
+        uuid: Str,
+        name: Str,
+        data: Str,
+        owner: []const Str,
+        access: []const Str,
+        cat: i64
+    ) !void {
+        return self.upsertWith(c_name, uuid, schema.Model {
+            .uuid = .{.text = uuid},
+            .name = .{.text = name},
+            .data = .{.blob = data},
+            .owner = .{.text = owner},
+            .access = .{.text = access},
+            .size = @intCast(data.len),
+            .cat = cat
+        });
+    }
+
     /// # Opens Object Streaming
     /// - `c_name` - Name of the object container (e.g., `user_img`)
     /// - `rid` - RowId of the object (must match the `uuid` record)
@@ -1228,8 +1362,6 @@ test "pooled connections serve concurrent operations" {
     );
     defer heap.free(dir_path);
 
-    // File-backed storage so the pool keeps multiple connections — in-memory
-    // storage collapses to a single connection and cannot exercise this
     const path = try std.fmt.allocPrintSentinel(heap, "{s}/pool.db", .{dir_path}, 0);
     defer heap.free(path);
 
@@ -1551,6 +1683,100 @@ test "provision and stream I/O bounds" {
         try testing.expect((try Object.incRead(&viewer, &buffer)) == null);
         try testing.expect((try Object.incRead(&viewer, &big_read)) == null);
     }
+}
+
+test "provisionWith upserts under a caller uuid" {
+    var s = try testSloop();
+    defer s.deinit();
+
+    var containers = s.bucket();
+    try containers.create("media");
+    var obj = s.object();
+
+    const urn = try Uuid.toUrn(&(try Uuid.new(testing.io)));
+
+    // Inserts under the caller-supplied uuid and cat
+    try obj.provisionWith(
+        "media", &urn, "clip.bin", 16, &.{"alice"}, &.{"bob"}, 12345
+    );
+
+    var info = try obj.info("media", &urn, "alice", .default);
+    defer info.free();
+
+    try testing.expectEqualStrings("clip.bin", info.value().name);
+    try testing.expectEqual(@as(i64, 16), info.value().size);
+    try testing.expectEqual(@as(i64, 12345), info.value().cat);
+    try testing.expectEqual(@as(usize, 1), info.value().owner.len);
+
+    // The blob is pre-sized and zero-filled for incremental writes
+    const blob = try obj.get("media", &urn, "alice", .default);
+    defer testing.allocator.free(blob);
+    try testing.expectEqual(@as(usize, 16), blob.len);
+
+    for (blob) |byte| try testing.expectEqual(@as(u8, 0), byte);
+
+    // Re-provisioning the same uuid resets the record in place
+    try obj.provisionWith(
+        "media", &urn, "clip2.bin", 8, &.{"alice"}, &.{}, 999
+    );
+
+    var again = try obj.info("media", &urn, "alice", .default);
+    defer again.free();
+
+    try testing.expectEqualStrings("clip2.bin", again.value().name);
+    try testing.expectEqual(@as(i64, 8), again.value().size);
+    try testing.expectEqual(@as(i64, 999), again.value().cat);
+
+    // The access list reset dropped the previous access entity
+    try testing.expectError(
+        Error.AccessDenied, obj.get("media", &urn, "bob", .default)
+    );
+}
+
+test "putWith upserts under a caller uuid" {
+    var s = try testSloop();
+    defer s.deinit();
+
+    var containers = s.bucket();
+    try containers.create("docs");
+    var obj = s.object();
+
+    const urn = try Uuid.toUrn(&(try Uuid.new(testing.io)));
+
+    // Inserts under the caller-supplied uuid and cat
+    try obj.putWith(
+        "docs", &urn, "doc.txt", "Hello, Sloop!",
+        &.{"alice"}, &.{"bob"}, 4242
+    );
+
+    var info = try obj.info("docs", &urn, "alice", .default);
+    defer info.free();
+
+    try testing.expectEqualStrings("doc.txt", info.value().name);
+    try testing.expectEqual(
+        @as(i64, "Hello, Sloop!".len), info.value().size
+    );
+    try testing.expectEqual(@as(i64, 4242), info.value().cat);
+
+    const blob = try obj.get("docs", &urn, "alice", .default);
+    defer testing.allocator.free(blob);
+    try testing.expectEqualStrings("Hello, Sloop!", blob);
+
+    // Re-pushing the same uuid overwrites the record in place
+    try obj.putWith(
+        "docs", &urn, "doc2.txt", "Replaced!", &.{"alice"}, &.{}, 777
+    );
+
+    var again = try obj.info("docs", &urn, "alice", .default);
+    defer again.free();
+
+    try testing.expectEqualStrings("doc2.txt", again.value().name);
+    try testing.expectEqual(@as(i64, 9), again.value().size);
+    try testing.expectEqual(@as(i64, 777), again.value().cat);
+
+    const data = try obj.get("docs", &urn, "alice", .default);
+    defer testing.allocator.free(data);
+    try testing.expectEqualStrings("Replaced!", data);
 }
 
 test "stream write requires ownership" {

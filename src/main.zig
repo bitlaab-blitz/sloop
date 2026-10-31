@@ -45,6 +45,58 @@ pub fn main(init: std.process.Init) !void {
 
     try obj.remove("test_img1", &put_uuid, null, .default);
 
+    // Upserts under a caller-supplied identity — the uuid and creation
+    // timestamp are owned by the caller (replica/sync flows) and stored
+    // as-is, without validation
+    const sync_urn = "0199c0a8-7d1e-7f3a-9b2c-4d5e6f708192";
+
+    try obj.putWith(
+        "test_img2", sync_urn, "synced.txt", "Synced, Sloop!",
+        &.{"john"}, &.{"jane"}, 1730000000
+    );
+
+    const synced = try obj.get("test_img2", sync_urn, "jane", .default);
+    defer sloop.heap.free(synced);
+    std.debug.print("{s}\n", .{synced});
+
+    // Re-pushing the same uuid overwrites the record in place — the owner
+    // and access lists are replaced with the given ones
+    try obj.putWith(
+        "test_img2", sync_urn, "synced2.txt", "Replaced!",
+        &.{"john"}, &.{}, 1730000001
+    );
+
+    var sync_info = try obj.info("test_img2", sync_urn, "john", .default);
+    defer sync_info.free();
+    std.debug.print("Synced: {s} | {d} bytes\n", .
+        {sync_info.value().name, sync_info.value().size});
+
+    // Pre-sizes a zero blob under the caller-supplied uuid for incremental
+    // writes (same stream rules as `provision()`)
+    const upload_urn = "0199c0a8-7d1e-7f3a-9b2c-4d5e6f708193";
+
+    try obj.provisionWith(
+        "test_img2", upload_urn, "upload.bin", 64,
+        &.{"john"}, &.{"jane"}, 1730000002
+    );
+
+    var upload_info = try obj.info("test_img2", upload_urn, "john", .default);
+    defer upload_info.free();
+
+    {
+        const rid = upload_info.value().rowid;
+        var uploader = try obj.openStream(
+            "test_img2", rid, upload_urn, "john", .default
+        );
+        defer Sloop.Object.closeStream(&uploader);
+
+        try Sloop.Object.incWrite(&uploader, "sloop", 0);
+    }
+
+    const uploaded = try obj.get("test_img2", upload_urn, "john", .default);
+    defer sloop.heap.free(uploaded);
+    std.debug.print("Uploaded: {s}\n", .{uploaded[0..5]});
+
     // Creates a provisional object in the bucket
 
     // Private object

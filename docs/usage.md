@@ -226,6 +226,37 @@ while(try Sloop.Object.incRead(&blob_reader, &buffer)) |data| {
 - `incRead()` returns `null` at the end of the stream — a buffer larger than
   the remaining data yields a partial read instead of an error
 
+## Upserting Under a Caller-Supplied Identity
+
+`putWith()` and `provisionWith()` are the replica/sync counterparts of
+`put()` and `provision()` — the record identity (`uuid`) and creation
+timestamp (`cat`) are owned by the caller instead of being generated:
+
+```zig
+// Full-record upsert under a caller-supplied uuid and timestamp
+const sync_urn = "0199c0a8-7d1e-7f3a-9b2c-4d5e6f708192";
+
+try obj.putWith("test_img2", sync_urn, "synced.txt", "Synced, Sloop!",
+    &.{"john"}, &.{"jane"}, 1730000000
+);
+
+// Pre-sized (zero blob) upsert for incremental writes
+try obj.provisionWith("test_img2", sync_urn, "upload.bin", 64,
+    &.{"john"}, &.{"jane"}, 1730000001
+);
+```
+
+**NOTE:**
+
+- Both are **upserts** — pushing a uuid that already exists overwrites the
+  record in place (name, data, size, owner and access lists are replaced;
+  `provisionWith()` resets the blob to a zero blob of the given size)
+- The `uuid` and `cat` are stored **as-is**
+- **WARNING:** The caller must ensure `uuid` is a well-formed URN — it is
+  stored without validation
+- Like `put()`/`provision()`, creation carries no ACL check — these are
+  intended for trusted replica/sync paths
+
 ## Scanning Object Containers
 
 ```zig

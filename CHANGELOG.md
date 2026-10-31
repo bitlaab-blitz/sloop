@@ -23,6 +23,30 @@ Here we write upgrading notes and make them as straightforward as possible.
 - A short description for fixed item n
 
 
+## [v1.6.0] - 2026-10-31
+
+Replica/sync release — upserts under a caller-supplied uuid and creation
+timestamp.
+
+### Added
+- `Object.putWith()` — upserts a complete object under a caller-supplied
+  uuid and `cat` timestamp, for replica/sync flows where record identity
+  and timestamps are owned by the caller; re-pushing an existing uuid
+  overwrites the record in place (owner/access lists replaced, stored
+  `size` reflects the given data)
+- `Object.provisionWith()` — upserts a pre-sized provisional record under
+  a caller-supplied uuid and `cat`; re-provisioning resets the blob to a
+  zero blob of the given size
+- `update_record` prepared statement in the per-connection statement cache
+  backing the upsert path
+- Demo of both upsert flows in `src/main.zig`, usage guide section and
+  unit tests covering insert and overwrite paths
+
+### Changed
+- Caller-supplied `uuid` and `cat` are stored as-is — **no URN validation**
+  is performed (documented WARNING in the API and `docs/usage.md`)
+
+
 ## [v1.5.0] - 2026-10-21
 
 Correctness release — transactional ACL mutations, snapshot-consistent reads
